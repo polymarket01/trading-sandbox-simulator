@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>沙盒流动性地图</title>
+    <link rel="stylesheet" href="static/app.css?v=sandbox-20260908-3" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="mark">LM</span>
+        <div class="brand-text">
+          <strong>流动性地图</strong>
+          <span id="marketLabel">沙盒交易所 · 只读</span>
+        </div>
+      </div>
+
+      <div class="symbol-box">
+        <select id="targetSelect" aria-label="交易所市场" title="选择交易所市场" hidden>
+          <option value="sandbox" selected>沙盒交易所</option>
+          
+        </select>
+        <select id="symbolSelect" aria-label="全部币对" title="选择全部已启用市场及已绑定铺单的币对">
+          <option value="">正在加载币对</option>
+        </select>
+        <input id="symbolInput" type="hidden" value="BTCUSDT" />
+        <datalist id="symbolList"></datalist>
+        <button id="switchButton" type="button">切换</button>
+        <span id="storageBadge" class="admin-link">本地保留 10 分钟</span>
+      </div>
+
+      <div id="statusBadge" class="badge waiting">STARTING</div>
+
+      <dl class="readout">
+        <div><dt>Last</dt><dd id="lastValue">--</dd></div>
+        <div><dt>Mid</dt><dd id="midValue">--</dd></div>
+        <div><dt>Spread</dt><dd id="spreadValue">--</dd></div>
+        <div><dt>纵轴</dt><dd id="coverageValue">--</dd></div>
+      </dl>
+
+      <div class="controls">
+        <label class="mode-control" title="实时盯盘固定最多10分钟且不读取磁盘历史；静态复盘冻结实时连接并固定读取10分钟。">
+          模式
+          <select id="appMode" aria-label="页面模式" disabled>
+            <option value="live" selected>实时 · 10分钟</option>
+            <option value="replay">复盘 · 10分钟</option>
+          </select>
+        </label>
+        <label title="Monochrome 灰阶最凸显气泡 / Bichrome 买卖分色 / Heatmap 强度优先">
+          配色
+          <select id="colorMode">
+            <option value="monochrome">Monochrome</option>
+            <option value="bichrome">Bichrome</option>
+            <option value="heatmap" selected>Heatmap</option>
+          </select>
+        </label>
+        <label
+          class="contrast-control"
+          title="Bookmap 风格黑色截止：向右只隐藏较小挂单并重新拉伸剩余色阶，大挂单更突出。只改变显示，不改变订单簿数据、气泡或 DOM 数值。"
+        >
+          对比
+          <input
+            id="heatContrast"
+            type="range"
+            min="0"
+            max="95"
+            step="1"
+            value="0"
+            aria-label="热图对比度"
+          />
+          <output id="heatContrastValue" for="heatContrast">0%</output>
+        </label>
+        <label title="每个气泡只对应一条上游成交事件；金额越大半径越大，不按时间、价格或方向在本地合并">
+          气泡
+          <select id="bubbleScale">
+            <option value="0.75">小</option>
+            <option value="1">中</option>
+            <option value="1.4">大</option>
+            <option value="1.9" selected>特大</option>
+          </select>
+        </label>
+        <label title="按每条上游成交事件自身的报价币名义金额过滤；多笔小单绝不会先合并再越过门槛">
+          单笔过滤
+          <select id="bubbleFloor">
+            <option value="fixed:0">不过滤</option>
+            <option value="fixed:100">≥ 100/条</option>
+            <option value="fixed:1000">≥ 1K/条</option>
+            <option value="fixed:5000" selected>≥ 5K/条</option>
+            <option value="fixed:20000">≥ 20K/条</option>
+            <option value="fixed:50000">≥ 50K/条</option>
+          </select>
+        </label>
+        <label
+          class="toggle"
+          title="仅实时盯盘生效。开启后，正常连续且间隔不超过1.5秒的盘口采样会沿用上一份真实盘口填平调度空档；断流、序号跳号、网格切换和真实长缺口仍保留黑色。只改变显示，不补造盘口数据。"
+        >
+          <input id="continuousHeatmapToggle" type="checkbox" checked />
+          连续显示
+        </label>
+        <label
+          class="toggle"
+          title="开启后，最新中间价会平滑保持在画面纵向中央；关闭后可手动平移查看，最新价进入顶部或底部20%边缘区时只自动居中一次，仍保持关闭。电脑竖向拖拽、手机主图区单指拖动会平移并自动关闭；双击或手机双点主图恢复价格跟随。手机在右侧价轴上下滑动可缩放纵轴；双击/双点右侧价轴才会按当前盘口重新适配。"
+        >
+          <input id="followToggle" type="checkbox" checked />
+          跟随价格
+          <span class="help-dot" aria-hidden="true">?</span>
+        </label>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="chart-pane">
+        <canvas id="chart"></canvas>
+        <div id="gapNotice" class="gap-notice hidden"></div>
+        <div id="historyNotice" class="history-notice hidden"></div>
+        <div id="coverageHint" class="coverage-hint">纵轴覆盖 --</div>
+        <div class="legend">
+          <span id="legendHeat"
+            ><i id="legendHeatSwatch" class="swatch heat"></i>挂单厚度</span
+          >
+          <span id="legendBid" class="hidden"
+            ><i id="legendBidSwatch" class="swatch bid"></i>买挂</span
+          >
+          <span id="legendAsk" class="hidden"
+            ><i id="legendAskSwatch" class="swatch ask"></i>卖挂</span
+          >
+          <span><i class="swatch buy"></i>逐条主动买</span>
+          <span><i class="swatch sell"></i>逐条主动卖</span>
+          <span class="trade-contract">每泡 = 1 笔沙盒成交，不本地合并</span>
+          <span><i class="swatch line-bid"></i>买一</span>
+          <span><i class="swatch line-ask"></i>卖一</span>
+        </div>
+      </section>
+
+      <aside id="tasPane" class="tas-pane">
+        <div class="tas-head">
+          <strong>TAS</strong>
+          <label title="只影响右侧成交明细列表，不影响主图气泡和统计">
+            过滤
+            <select id="tasFilter">
+              <option value="0">不过滤</option>
+              <option value="1000">≥ 1,000</option>
+              <option value="5000">≥ 5,000</option>
+              <option value="10000" selected>≥ 10,000</option>
+              <option value="50000">≥ 50,000</option>
+            </select>
+          </label>
+          <button id="tasPause" type="button" class="ghost">暂停</button>
+        </div>
+        <div class="tas-columns">
+          <span>时间</span>
+          <span>价格</span>
+          <span>金额</span>
+        </div>
+        <div id="tasList" class="tas-list"></div>
+        <div class="tas-foot">
+          <span id="tasMeta">有界列表，仅内存</span>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span id="feedStatus">等待连接</span>
+      <span id="gridStatus">--</span>
+      <span id="scaleInfo">--</span>
+      <span id="perfStatus">--</span>
+      <span class="notice"
+        >沙盒订单簿 · 每秒采样 · 每泡为1笔沙盒成交 · 本地仅保留10分钟 · 缺失区间留空</span
+      >
+    </footer>
+
+    <script src="static/app.js?v=sandbox-20260908-live"></script>
+  </body>
+</html>

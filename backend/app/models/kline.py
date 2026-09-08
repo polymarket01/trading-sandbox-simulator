@@ -28,3 +28,4 @@ class Kline(Base):
     volume: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False, default=0)
     quote_volume: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False, default=0)
     trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")

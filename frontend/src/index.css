@@ -4,27 +4,36 @@
 
 :root {
   color-scheme: dark;
-  --bg: #08131d;
-  --panel: rgba(10, 27, 40, 0.8);
-  --panel-strong: rgba(8, 18, 29, 0.96);
+  --bg: #0b1517;
+  --panel: #0e1a1b;
+  --panel-strong: #0b1517;
   --line: rgba(255, 255, 255, 0.08);
-  --text: #ecf6ff;
-  --muted: #8ca9bf;
-  --green: #22c59b;
-  --red: #ff6d73;
-  --amber: #f7b955;
+  --text: #e8f2ef;
+  --muted: #839894;
+  --green: #38d6b0;
+  --red: #f35f72;
+  --amber: #e9b96b;
+  --hl-bg: #0b1517;
+  --hl-surface: #0e1a1b;
+  --hl-surface-raised: #112021;
+  --hl-surface-strong: #132526;
+  --hl-line: rgba(181, 222, 214, 0.095);
+  --hl-line-strong: rgba(181, 222, 214, 0.17);
+  --hl-text: #e8f2ef;
+  --hl-muted: #7e9490;
+  --hl-buy: #35d6b2;
+  --hl-sell: #f05f72;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at top left, rgba(23, 90, 126, 0.45), transparent 28%),
-    radial-gradient(circle at top right, rgba(227, 122, 71, 0.2), transparent 24%),
-    linear-gradient(180deg, #0d1d2c 0%, #07111b 46%, #050d14 100%);
+  background: var(--hl-bg);
   color: var(--text);
   font-family: "IBM Plex Sans", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 #root {
@@ -32,14 +41,483 @@ body {
 }
 
 .panel {
-  border: 1px solid var(--line);
-  background: linear-gradient(180deg, rgba(17, 35, 49, 0.82) 0%, rgba(9, 21, 34, 0.94) 100%);
-  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.25);
-  backdrop-filter: blur(18px);
+  border: 1px solid var(--hl-line);
+  background: var(--hl-surface);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  backdrop-filter: none;
+  isolation: isolate;
+}
+
+/* 统一外壳：页面内容与导航的间距一致（交易面由 hl-* 自行控制） */
+.app-shell:not(.hl-shell) .app-shell-main {
+  padding-top: 0;
+}
+
+/* 统一页面标题与区块排版（h2 亦纳入：机器人/后台页以 h2 作为页题） */
+.app-shell-main h1,
+.app-shell-main h2 {
+  font-family: "Space Grotesk", sans-serif;
+  letter-spacing: -0.01em;
+  color: var(--hl-text);
+}
+
+.app-shell-main section.panel {
+  border-radius: 1rem;
+}
+
+.paper-input {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.9rem;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.65rem 0.8rem;
+  color: #ecf6ff;
+  outline: none;
+}
+
+.paper-input:focus {
+  border-color: rgba(103, 232, 249, 0.55);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08);
+}
+
+/* Shared UI primitives: the same states should look and behave the same on
+   the trading, paper, operations, and admin surfaces. */
+.ui-status-pill,
+.ui-connection-badge {
+  border: 1px solid rgba(181, 222, 214, 0.08);
+  line-height: 1.25rem;
+}
+
+.ui-tab {
+  min-height: 2rem;
+}
+
+.ui-tab:focus-visible,
+.ui-retry-button:focus-visible,
+.ui-refresh-button:focus-visible,
+.ui-dialog-cancel:focus-visible,
+.ui-dialog-confirm:focus-visible,
+.ui-toast:focus-visible {
+  outline: 2px solid rgba(56, 214, 176, 0.85);
+  outline-offset: 2px;
+}
+
+.ui-empty-state,
+.ui-error-state {
+  min-height: 7rem;
+}
+
+.ui-toast {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  backdrop-filter: blur(12px);
+}
+
+/* Non-trading pages share the same restrained shell as the terminal, but
+   keep their natural document height for tables and management forms. */
+.app-shell:not(.hl-shell),
+.paper-shell:not(.hl-shell) {
+  min-height: 100vh;
+  padding: 0 clamp(0.75rem, 2vw, 1.75rem) 0.75rem !important;
+  background: var(--hl-bg) !important;
+}
+
+.app-shell-inner:not(.hl-shell-inner),
+.paper-shell-inner:not(.hl-shell-inner) {
+  width: 100%;
+  max-width: 1680px !important;
+}
+
+/* 顶栏与交易终端完全同款：贴顶、无圆角、56px 紧凑条，仅保留吸顶。
+   切换页面时顶栏的位置、字号、间距、颜色不再跳变。 */
+.app-shell:not(.hl-shell) .app-shell-header,
+.paper-shell:not(.hl-shell) .paper-shell-header {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 30;
+  min-height: 56px;
+  margin: 0 !important;
+  border-top: 0 !important;
+  border-right: 0 !important;
+  border-left: 0 !important;
+  border-radius: 0 !important;
+  border-color: var(--hl-line) !important;
+  background: #0d1819 !important;
+  padding: 0.55rem 0.9rem !important;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.24) !important;
+  backdrop-filter: none !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header p,
+.paper-shell:not(.hl-shell) .paper-shell-header p {
+  color: var(--hl-muted);
+}
+
+.app-shell:not(.hl-shell) .app-shell-header > div:first-child,
+.paper-shell:not(.hl-shell) .paper-shell-header > div:first-child {
+  min-width: 0 !important;
+  gap: 0.45rem !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header > div:first-child > div:first-child,
+.paper-shell:not(.hl-shell) .paper-shell-header > div:first-child > div:first-child {
+  display: none;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header > div:last-child,
+.paper-shell:not(.hl-shell) .paper-shell-header > div:last-child {
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header nav,
+.paper-shell:not(.hl-shell) .paper-shell-header nav {
+  min-width: 0;
+  align-items: center;
+  gap: 0.35rem !important;
+  font-size: 0.75rem !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header nav > div,
+.paper-shell:not(.hl-shell) .paper-shell-header nav > div {
+  gap: 0.15rem !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header nav > div > span,
+.paper-shell:not(.hl-shell) .paper-shell-header nav > div > span {
+  display: none !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header nav a,
+.paper-shell:not(.hl-shell) .paper-shell-header nav a {
+  border-radius: 0.35rem !important;
+  padding: 0.42rem 0.62rem !important;
+  color: #9aaba7 !important;
+  white-space: nowrap;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header nav a[aria-current="page"],
+.paper-shell:not(.hl-shell) .paper-shell-header nav a[aria-current="page"],
+.app-shell:not(.hl-shell) .app-shell-header nav a.active,
+.paper-shell:not(.hl-shell) .paper-shell-header nav a.active {
+  background: rgba(53, 214, 178, 0.12) !important;
+  color: var(--hl-buy) !important;
+}
+
+.app-shell:not(.hl-shell) .app-shell-header .rounded-full,
+.paper-shell:not(.hl-shell) .paper-shell-header .rounded-full {
+  background: transparent !important;
+  padding: 0.25rem 0.4rem !important;
+}
+
+.app-shell-main,
+.paper-shell-main {
+  min-width: 0;
+}
+
+.app-shell:not(.hl-shell) .app-shell-main,
+.paper-shell:not(.hl-shell) .paper-shell-main {
+  margin-top: 0.75rem;
+}
+
+.app-shell:not(.hl-shell) .panel,
+.paper-shell:not(.hl-shell) .panel {
+  border-color: var(--hl-line) !important;
+  border-radius: 0.65rem !important;
+  background: var(--hl-surface) !important;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2) !important;
+}
+
+.app-shell:not(.hl-shell) .rounded-3xl,
+.paper-shell:not(.hl-shell) .rounded-3xl {
+  border-radius: 0.65rem !important;
+}
+
+.app-shell:not(.hl-shell) .rounded-2xl,
+.paper-shell:not(.hl-shell) .rounded-2xl {
+  border-radius: 0.45rem !important;
+}
+
+.app-shell:not(.hl-shell) .rounded-xl,
+.paper-shell:not(.hl-shell) .rounded-xl,
+.app-shell:not(.hl-shell) .rounded-full,
+.paper-shell:not(.hl-shell) .rounded-full {
+  border-radius: 0.35rem !important;
+}
+
+/* 顶栏自身圆角必须为 0（JSX 上的 rounded-2xl 归一规则需让位） */
+.app-shell:not(.hl-shell) .app-shell-header,
+.paper-shell:not(.hl-shell) .paper-shell-header {
+  border-radius: 0 !important;
+}
+
+/* Shared metric card: every document page uses the same label/value rhythm.
+   Page components may add truncate / num-fixed etc. on top. */
+@layer components {
+  .ui-metric {
+    min-width: 0;
+    border-radius: 0.45rem;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 0.6rem 0.75rem;
+  }
+
+  .ui-metric-label {
+    overflow: hidden;
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--hl-muted);
+  }
+
+  .ui-metric-value {
+    margin-top: 0.25rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.875rem;
+    line-height: 1.35;
+    font-variant-numeric: tabular-nums;
+    color: var(--hl-text);
+  }
+
+  .ui-metric-hint {
+    margin-top: 0.2rem;
+    overflow: hidden;
+    font-size: 0.625rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--hl-muted);
+  }
+
+  /* Toast tones stay on the design-system palette, not the default emerald/rose. */
+  .ui-toast-kind-success {
+    border-color: rgba(53, 214, 178, 0.35) !important;
+    background: var(--hl-buy) !important;
+    color: #06211c !important;
+  }
+
+  .ui-toast-kind-error {
+    border-color: rgba(240, 95, 114, 0.35) !important;
+    background: var(--hl-sell) !important;
+    color: #fff !important;
+  }
+
+  .ui-toast-kind-info {
+    border-color: rgba(53, 214, 178, 0.22) !important;
+    background: var(--hl-surface-strong) !important;
+    color: var(--hl-text) !important;
+  }
+}
+
+.app-shell:not(.hl-shell) table,
+.paper-shell:not(.hl-shell) table {
+  border-collapse: separate;
+  border-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 横向滚动容器必须可收缩到父级宽度，否则 min-w 表格会把文档撑出横向溢出 */
+.app-shell:not(.hl-shell) .overflow-x-auto,
+.paper-shell:not(.hl-shell) .overflow-x-auto {
+  min-width: 0;
+}
+
+/* grid 子项默认 min-width:auto，会被 min-w 表格内容撑开列宽导致窄屏横向溢出 */
+.app-shell:not(.hl-shell) .grid > *,
+.paper-shell:not(.hl-shell) .grid > * {
+  min-width: 0;
+}
+
+.app-shell:not(.hl-shell) thead th,
+.paper-shell:not(.hl-shell) thead th {
+  border-bottom: 1px solid var(--hl-line-strong);
+  color: var(--hl-muted);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.025em;
+  text-transform: uppercase;
+}
+
+.app-shell:not(.hl-shell) tbody tr,
+.paper-shell:not(.hl-shell) tbody tr {
+  transition: background-color 140ms ease;
+}
+
+.app-shell:not(.hl-shell) tbody tr:hover,
+.paper-shell:not(.hl-shell) tbody tr:hover {
+  background: rgba(56, 214, 176, 0.045);
+}
+
+.app-shell:not(.hl-shell) tbody td,
+.paper-shell:not(.hl-shell) tbody td {
+  border-bottom: 1px solid rgba(181, 222, 214, 0.055);
+}
+
+.app-shell:not(.hl-shell) input:not([type="checkbox"]):not([type="radio"]),
+.app-shell:not(.hl-shell) select,
+.app-shell:not(.hl-shell) textarea,
+.paper-shell:not(.hl-shell) input:not([type="checkbox"]):not([type="radio"]),
+.paper-shell:not(.hl-shell) select,
+.paper-shell:not(.hl-shell) textarea {
+  border-color: var(--hl-line-strong) !important;
+  border-radius: 0.35rem !important;
+  background: rgba(8, 18, 19, 0.72) !important;
+  color: var(--hl-text);
+  outline: none;
+  padding: 0.45rem 0.75rem !important;
+}
+
+.app-shell:not(.hl-shell) input:not([type="checkbox"]):not([type="radio"]):focus,
+.app-shell:not(.hl-shell) select:focus,
+.app-shell:not(.hl-shell) textarea:focus,
+.paper-shell:not(.hl-shell) input:not([type="checkbox"]):not([type="radio"]):focus,
+.paper-shell:not(.hl-shell) select:focus,
+.paper-shell:not(.hl-shell) textarea:focus {
+  border-color: rgba(56, 214, 176, 0.58) !important;
+  box-shadow: 0 0 0 3px rgba(56, 214, 176, 0.1);
+}
+
+.app-shell:not(.hl-shell) button,
+.paper-shell:not(.hl-shell) button {
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.app-shell:not(.hl-shell) button:disabled,
+.paper-shell:not(.hl-shell) button:disabled {
+  cursor: not-allowed;
+}
+
+.app-shell:not(.hl-shell) footer,
+.paper-shell:not(.hl-shell) footer {
+  padding-top: 1.25rem;
+  padding-bottom: 1rem;
+}
+
+@media (min-width: 900px) {
+  .app-shell:not(.hl-shell) .app-shell-header,
+  .paper-shell:not(.hl-shell) .paper-shell-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+  }
+
+  /* 文档页侧栏：吸顶位置要完全避开吸顶顶栏（贴顶 56px + 8px 空隙 = 4rem）。 */
+  .app-shell:not(.hl-shell) .ui-sidebar,
+  .paper-shell:not(.hl-shell) .ui-sidebar {
+    position: sticky;
+    top: 4rem !important;
+    max-height: calc(100vh - 4.5rem) !important;
+  }
+
+  .paper-shell:not(.hl-shell) .paper-shell-header > div:first-child {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .paper-shell:not(.hl-shell) .paper-shell-header > div:last-child {
+    margin-top: 0;
+  }
+}
+
+/* Auth pages use the same surface palette without inheriting a navigation
+   shell. The two login modes stay distinct in copy, not in visual language. */
+.auth-page {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 12% 12%, rgba(56, 214, 176, 0.1), transparent 32rem),
+    var(--hl-bg);
+  padding: clamp(1rem, 4vw, 3rem) 1rem;
+}
+
+.auth-layout {
+  width: min(100%, 980px);
+  min-height: calc(100vh - clamp(2rem, 8vw, 6rem));
+  align-items: center;
+}
+
+.auth-hero,
+.auth-card {
+  align-self: center;
+  width: 100%;
+  border: 1px solid var(--hl-line);
+  border-radius: 0.65rem !important;
+  background: rgba(14, 26, 27, 0.92);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
+}
+
+.auth-hero {
+  background: linear-gradient(145deg, rgba(56, 214, 176, 0.08), rgba(14, 26, 27, 0.92) 55%);
+}
+
+.auth-card input:not([type="checkbox"]):not([type="radio"]),
+.auth-card select,
+.auth-card textarea {
+  border-color: var(--hl-line-strong) !important;
+  border-radius: 0.35rem !important;
+  background: rgba(8, 18, 19, 0.72) !important;
+  padding: 0.6rem 0.75rem !important;
+}
+
+.auth-card input:focus,
+.auth-card select:focus,
+.auth-card textarea:focus {
+  border-color: rgba(56, 214, 176, 0.58) !important;
+  box-shadow: 0 0 0 3px rgba(56, 214, 176, 0.1);
+}
+
+.auth-card button[type="submit"] {
+  border-radius: 0.4rem !important;
+  background: var(--hl-buy);
+  transition: filter 140ms ease, opacity 140ms ease;
+}
+
+.auth-card button[type="submit"]:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.book-row-stable {
+  contain: layout paint style;
+  background-clip: padding-box;
+  transition-property: none;
 }
 
 .mono {
   font-family: "JetBrains Mono", monospace;
+}
+
+.num-fixed {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: clip;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.num-left {
+  text-align: left;
+}
+
+.num-price {
+  min-width: 11ch;
+}
+
+.num-qty {
+  min-width: 10ch;
+}
+
+.num-money {
+  min-width: 12ch;
+}
+
+.num-short {
+  min-width: 7ch;
 }
 
 .scrollbar::-webkit-scrollbar {
@@ -50,4 +528,648 @@ body {
 .scrollbar::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.14);
   border-radius: 999px;
+}
+
+/* Hyperliquid-inspired trade surface. These styles are scoped so the
+   existing admin/account pages retain their original information layout. */
+.hl-shell {
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0 !important;
+  background: var(--hl-bg) !important;
+}
+
+.hl-shell-inner {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  max-width: none !important;
+  flex-direction: column;
+}
+
+.hl-app-header {
+  position: relative !important;
+  top: 0 !important;
+  z-index: 30;
+  min-height: 56px;
+  margin: 0 !important;
+  flex-shrink: 0;
+  gap: 0.6rem !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  border-top: 0 !important;
+  border-right: 0 !important;
+  border-left: 0 !important;
+  border-radius: 0 !important;
+  border-color: var(--hl-line) !important;
+  background: #0d1819 !important;
+  padding: 0.55rem 0.9rem !important;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.24) !important;
+  backdrop-filter: none !important;
+}
+
+.hl-sandbox-health-block {
+  display: none !important;
+}
+
+.hl-app-header > div:last-child {
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+}
+
+.hl-app-header p,
+.hl-paper-notice,
+.hl-app-header .shadow-glow {
+  display: none !important;
+}
+
+.hl-app-header nav {
+  align-items: center;
+  gap: 0.35rem !important;
+  font-size: 0.75rem !important;
+}
+
+.hl-app-header nav > div {
+  gap: 0.15rem !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+.hl-app-header nav > div > span {
+  display: none !important;
+}
+
+.hl-app-header nav a {
+  border-radius: 0.35rem !important;
+  padding: 0.42rem 0.62rem !important;
+  color: #9aaba7 !important;
+}
+
+.hl-app-header nav a[aria-current="page"],
+.hl-app-header nav a.active {
+  background: rgba(53, 214, 178, 0.12) !important;
+  color: var(--hl-buy) !important;
+}
+
+.hl-app-header > div:first-child {
+  min-width: 0 !important;
+  gap: 0.45rem !important;
+}
+
+.hl-app-header .hl-brand-link,
+.app-shell:not(.hl-shell) .app-shell-header .hl-brand-link,
+.paper-shell:not(.hl-shell) .paper-shell-header .hl-brand-link {
+  max-width: 175px;
+  overflow: hidden;
+  font-size: 0.96rem !important;
+  line-height: 1.2 !important;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hl-app-header > div:first-child > div:first-child {
+  display: none;
+}
+
+.hl-app-header button,
+.hl-app-header a {
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.hl-app-header .rounded-full,
+.hl-app-header .rounded-2xl {
+  border-radius: 0.35rem !important;
+}
+
+.hl-app-header .rounded-full {
+  background: transparent !important;
+  padding: 0.25rem 0.4rem !important;
+}
+
+.hl-main {
+  min-height: 0;
+  flex: 1 1 auto;
+  margin-top: 0 !important;
+  overflow: hidden;
+}
+
+.hl-paper-trade-content {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.hl-paper-trade-content > .hl-terminal {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.hl-shell footer {
+  display: none !important;
+}
+
+.hl-shell .hl-admin-bar {
+  display: none !important;
+}
+
+.hl-terminal {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: 0 !important;
+  overflow: hidden;
+  color: var(--hl-text);
+}
+
+.hl-terminal .panel {
+  border-color: var(--hl-line) !important;
+  border-radius: 0 !important;
+  background: var(--hl-surface) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+.hl-terminal .panel.rounded-2xl,
+.hl-terminal .panel.rounded-xl,
+.hl-terminal .panel.rounded-lg {
+  border-radius: 0 !important;
+}
+
+.hl-terminal .text-slate-500,
+.hl-terminal .text-slate-600 {
+  color: var(--hl-muted) !important;
+}
+
+.hl-terminal .hl-marketbar {
+  min-height: 88px;
+  flex-shrink: 0;
+  border-top: 0 !important;
+  border-right: 0 !important;
+  border-left: 0 !important;
+  padding: 0.75rem 0.95rem !important;
+}
+
+.hl-terminal .hl-marketbar > div:first-child {
+  min-width: 0;
+  flex-wrap: nowrap;
+}
+
+.hl-terminal .hl-marketbar select {
+  height: 2.25rem;
+  border: 0 !important;
+  border-radius: 0.35rem !important;
+  background: rgba(255, 255, 255, 0.045) !important;
+  padding: 0 2rem 0 0.55rem !important;
+  font-size: 0.9rem !important;
+}
+
+.hl-terminal .hl-marketbar .text-2xl {
+  font-size: 1.1rem !important;
+  line-height: 1.35 !important;
+}
+
+.hl-terminal .hl-marketbar .text-sm {
+  font-size: 0.72rem !important;
+}
+
+.hl-terminal .hl-marketbar [class*="rounded-xl"],
+.hl-terminal .hl-marketbar [class*="rounded-lg"],
+.hl-terminal .hl-marketbar [class*="rounded-md"] {
+  border-radius: 0.25rem !important;
+}
+
+.hl-terminal .hl-marketbar .gap-x-5 {
+  column-gap: 1.15rem !important;
+}
+
+.hl-terminal .hl-marketbar .gap-y-2 {
+  row-gap: 0.35rem !important;
+}
+
+.hl-terminal .hl-marketbar .font-mono {
+  letter-spacing: -0.01em;
+}
+
+.hl-terminal .hl-transport-line {
+  display: flex;
+  min-height: 21px;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.8rem;
+  border-bottom: 1px solid var(--hl-line);
+  background: rgba(6, 13, 14, 0.48);
+  padding: 0.15rem 0.95rem;
+  font-size: 0.61rem;
+}
+
+.hl-terminal .hl-transport-line .rounded-full,
+.hl-terminal .hl-transport-line .rounded-lg {
+  border-radius: 0.2rem !important;
+}
+
+.hl-terminal .hl-workspace {
+  display: grid;
+  min-height: 0;
+  flex: 1 1 auto;
+  /* 图表列压缩给中列让位：中列 = 订单簿 + 最新成交 并行，订单簿可显示更多层 */
+  grid-template-columns: minmax(280px, 1fr) minmax(700px, 1.7fr) minmax(320px, 0.7fr);
+  grid-template-areas: "chart book order";
+  gap: 0;
+  overflow: hidden;
+}
+
+.hl-terminal .hl-chart-panel,
+.hl-terminal .hl-book-column,
+.hl-terminal .hl-order-column {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.hl-terminal .hl-chart-panel {
+  grid-area: chart;
+}
+
+.hl-terminal .hl-book-column {
+  grid-area: book;
+}
+
+.hl-terminal .hl-order-column {
+  grid-area: order;
+}
+
+.hl-terminal .hl-chart-panel {
+  border-right: 1px solid var(--hl-line) !important;
+}
+
+.hl-terminal .hl-book-column {
+  display: grid;
+  /* 订单簿与最新成交并行、等高：订单簿不再被下方固定高度的成交区挤压 */
+  grid-template-columns: minmax(440px, 2fr) minmax(250px, 0.9fr);
+  grid-template-rows: minmax(0, 1fr);
+  border-right: 1px solid var(--hl-line) !important;
+}
+
+.hl-terminal .hl-order-column {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.hl-terminal .hl-workspace > .hl-book-column > .panel,
+.hl-terminal .hl-workspace > .hl-order-column > .panel,
+.hl-terminal .hl-workspace > .hl-chart-panel {
+  border-top: 0 !important;
+  border-bottom: 1px solid var(--hl-line) !important;
+}
+
+.hl-terminal .hl-chart-head {
+  min-height: 38px;
+  border-bottom: 1px solid var(--hl-line);
+  padding: 0.35rem 0.7rem !important;
+}
+
+.hl-terminal .hl-chart-head button,
+.hl-terminal .hl-book-head button,
+.hl-terminal .hl-bottom-tabs button {
+  border-radius: 0.2rem !important;
+}
+
+.hl-terminal .hl-chart-body {
+  min-height: 0 !important;
+  padding: 0 !important;
+}
+
+.hl-terminal .hl-chart-body .hl-kline-meta {
+  min-height: 29px;
+  max-height: 31px;
+  margin: 0 !important;
+  flex-wrap: nowrap !important;
+  gap: 0.35rem !important;
+  overflow: hidden;
+  padding: 0 0.55rem;
+}
+
+.hl-terminal .hl-chart-body .hl-kline-ohlc {
+  display: flex !important;
+  min-height: 29px !important;
+  align-items: center;
+  gap: 0.8rem !important;
+  overflow: hidden;
+  border-radius: 0 !important;
+  background: transparent !important;
+  padding: 0 !important;
+  white-space: nowrap;
+}
+
+.hl-terminal .hl-chart-body .hl-kline-ohlc > span:nth-child(n + 6),
+.hl-terminal .hl-chart-body .hl-kline-ohlc > div,
+.hl-terminal .hl-chart-body .hl-kline-meta > div:last-child {
+  display: none !important;
+}
+
+.hl-terminal .hl-chart-body .hl-kline-meta > div:last-child {
+  flex: 0 0 auto;
+}
+
+.hl-terminal .hl-chart-body > div,
+.hl-terminal .hl-chart-body canvas {
+  min-height: 0 !important;
+}
+
+.hl-terminal .hl-book-panel,
+.hl-terminal .hl-trades-panel,
+.hl-terminal .hl-order-panel,
+.hl-terminal .hl-position-panel,
+.hl-terminal .hl-orders-panel {
+  min-height: 0 !important;
+  overflow: hidden;
+  padding: 0.55rem !important;
+}
+
+.hl-terminal .hl-book-panel,
+.hl-terminal .hl-trades-panel,
+.hl-terminal .hl-order-panel {
+  height: 100% !important;
+}
+
+.hl-terminal .hl-book-panel {
+  border-radius: 0 !important;
+}
+
+.hl-terminal .hl-book-head {
+  min-height: 29px;
+  border-bottom: 1px solid var(--hl-line);
+  padding: 0 0.1rem 0.35rem !important;
+}
+
+.hl-terminal .hl-book-panel [data-book-row] {
+  min-height: 18px;
+  border-radius: 0.1rem !important;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  font-size: 0.67rem !important;
+  line-height: 18px !important;
+}
+
+.hl-terminal .hl-book-panel [data-book-row]:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+}
+
+.hl-terminal .hl-book-panel .bg-emerald-400\/8 {
+  background: rgba(53, 214, 178, 0.12) !important;
+}
+
+.hl-terminal .hl-book-panel .bg-rose-500\/8 {
+  background: rgba(240, 95, 114, 0.12) !important;
+}
+
+.hl-terminal .hl-book-panel .hl-book-active-order {
+  box-shadow: inset 2px 0 0 var(--hl-buy);
+  background: rgba(53, 214, 178, 0.1) !important;
+}
+
+.hl-terminal .hl-trades-panel {
+  /* 并行布局下与订单簿相邻：去掉自身左边框，用订单簿右边缘做分隔线 */
+  border-left: 0 !important;
+}
+
+.hl-terminal .hl-trades-panel > div:first-child,
+.hl-terminal .hl-orders-panel > div:first-child {
+  border-bottom-color: var(--hl-line) !important;
+}
+
+.hl-terminal .hl-trades-panel [class*="py-\[3px\]"] {
+  min-height: 18px;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  font-size: 0.65rem !important;
+  line-height: 18px !important;
+}
+
+.hl-terminal .hl-order-panel {
+  overflow: hidden;
+  border-bottom: 1px solid var(--hl-line) !important;
+}
+
+.hl-terminal .hl-order-panel input,
+.hl-terminal .hl-order-panel select {
+  min-height: 31px;
+  border: 1px solid var(--hl-line) !important;
+  border-radius: 0.25rem !important;
+  background: rgba(255, 255, 255, 0.045) !important;
+  padding-top: 0.35rem !important;
+  padding-bottom: 0.35rem !important;
+}
+
+.hl-terminal .hl-order-panel button {
+  border-radius: 0.22rem !important;
+}
+
+.hl-terminal .hl-order-panel .hl-submit {
+  min-height: 37px;
+  border-radius: 0.28rem !important;
+}
+
+.hl-terminal .hl-position-panel {
+  max-height: 165px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--hl-line) !important;
+}
+
+.hl-terminal .hl-bottom-tabs {
+  display: grid;
+  min-height: 180px;
+  max-height: 235px;
+  grid-template-rows: 38px minmax(0, 1fr);
+  border-top: 1px solid var(--hl-line);
+  background: var(--hl-surface);
+}
+
+.hl-terminal .hl-bottom-tabs .hl-tab-row {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--hl-line);
+  padding: 0 0.75rem;
+}
+
+.hl-terminal .hl-bottom-tabs .hl-tab-row button {
+  height: 100%;
+  border-bottom: 2px solid transparent;
+  padding: 0 0.55rem;
+  color: var(--hl-muted);
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.hl-terminal .hl-bottom-tabs .hl-tab-row button[data-active="true"] {
+  border-bottom-color: var(--hl-buy);
+  color: var(--hl-text);
+}
+
+.hl-terminal .hl-bottom-tabs .hl-tab-content {
+  min-height: 0;
+  overflow: auto;
+  padding: 0.45rem 0.75rem;
+}
+
+.hl-terminal .hl-bottom-tabs table {
+  font-size: 0.66rem !important;
+}
+
+.hl-terminal .hl-bottom-tabs th {
+  font-size: 0.58rem !important;
+  font-weight: 500;
+}
+
+.hl-terminal .hl-bottom-tabs td,
+.hl-terminal .hl-bottom-tabs th {
+  border-color: var(--hl-line) !important;
+  padding-top: 0.32rem !important;
+  padding-bottom: 0.32rem !important;
+}
+
+.hl-terminal .hl-account-strip {
+  display: grid;
+  min-height: 64px;
+  grid-template-columns: minmax(240px, 1fr) repeat(4, minmax(120px, 0.55fr));
+  align-items: center;
+  gap: 0;
+  border-top: 1px solid var(--hl-line);
+  background: #0a1415;
+  padding: 0 0.8rem;
+}
+
+.hl-terminal .hl-account-strip > div {
+  min-width: 0;
+  border-right: 1px solid var(--hl-line);
+  padding: 0 0.7rem;
+}
+
+.hl-terminal .hl-account-strip > div:first-child {
+  padding-left: 0;
+}
+
+.hl-terminal .hl-account-strip > div:last-child {
+  border-right: 0;
+}
+
+.hl-terminal .hl-account-strip .font-mono {
+  font-size: 0.75rem;
+}
+
+.hl-shell .fixed.right-4.top-4 {
+  z-index: 80;
+}
+
+.hl-shell [role="dialog"] > div {
+  border-color: var(--hl-line) !important;
+  border-radius: 0.35rem !important;
+  background: var(--hl-surface-strong) !important;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45) !important;
+}
+
+@media (max-width: 1150px) {
+  .hl-terminal .hl-workspace {
+    grid-template-columns: minmax(0, 1fr) 330px;
+    grid-template-areas: "chart book";
+  }
+
+  .hl-terminal .hl-order-column {
+    display: none;
+  }
+
+  /* 中列收窄后并行放不下：订单簿与最新成交恢复上下堆叠，信息不丢失 */
+  .hl-terminal .hl-book-column {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) 142px;
+  }
+
+  .hl-terminal .hl-trades-panel {
+    border-top: 0 !important;
+    border-left: 0 !important;
+  }
+}
+
+@media (max-width: 780px) {
+  .hl-shell {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .hl-shell-inner,
+  .hl-terminal {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .hl-app-header {
+    min-height: 50px;
+  }
+
+  .hl-terminal .hl-workspace {
+    display: flex;
+    flex-direction: column;
+    overflow: visible;
+  }
+
+  .hl-terminal .hl-chart-panel {
+    min-height: 480px;
+    border-right: 0 !important;
+  }
+
+  .hl-terminal .hl-book-column,
+  .hl-terminal .hl-order-column {
+    display: grid;
+    min-height: 560px;
+    border-right: 0 !important;
+  }
+
+  .hl-terminal .hl-account-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem 0;
+    padding: 0.55rem;
+  }
+
+  .hl-terminal .hl-account-strip > div {
+    border-right: 0;
+  }
+}
+
+/* Shared interaction polish: visible keyboard focus and stable numeric widths. */
+button:focus-visible, a:focus-visible, summary:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+button:disabled { cursor: not-allowed; }
+.app-shell:not(.hl-shell) .app-shell-main { padding-top: 12px; }
+.admin-workspace { font-variant-numeric: tabular-nums; }
+@media (min-width: 1280px) { .ui-sidebar { position: sticky; top: 88px; max-height: calc(100vh - 104px); align-self: start; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
+
+/* Full-width terminal: price chart, two-sided book, tape and order entry. */
+.hl-terminal .hl-book-head { flex-wrap: wrap; }
+.hl-terminal .hl-book-sides .num-fixed { min-width: 0; width: auto; }
+@media (min-width: 781px) and (max-width: 1150px) {
+  .hl-terminal .hl-workspace { grid-template-columns: minmax(260px, 1fr) minmax(420px, 1.35fr); grid-template-areas: "chart book"; }
+  .hl-terminal .hl-order-column { display: none; }
+  .hl-terminal .hl-book-column { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 142px; }
+}
+@media (max-width: 780px) {
+  .hl-terminal .hl-book-column { height: 760px; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 180px; }
+  .hl-terminal .hl-book-sides [data-book-row] { font-size: 10px; padding-left: 2px; padding-right: 2px; }
+}
+
+@media (min-width: 1151px) and (max-width: 1300px) {
+  .hl-terminal .hl-workspace { grid-template-columns: minmax(260px, 1fr) minmax(440px, 1.4fr) 320px; }
+  .hl-terminal .hl-book-column { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 142px; }
 }

@@ -18,6 +18,7 @@ class Balance(Base):
     asset: Mapped[str] = mapped_column(String(16), nullable=False)
     available: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False, default=0)
     frozen: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False, default=0)
+    account_run_id: Mapped[str | None] = mapped_column(String(96))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

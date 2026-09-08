@@ -1,0 +1,616 @@
+:root {
+  --bg: #05080d;
+  --panel: #0a1017;
+  --panel-2: #0d151e;
+  --line: #1b2836;
+  --text: #d6e4ef;
+  --muted: #6f8496;
+  --buy: #22c55e;
+  --sell: #ef4444;
+  --accent: #38bdf8;
+  --warn: #f59e0b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: hidden;
+}
+
+/* ------------------------------------------------------------------ topbar */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.topbar > * {
+  flex: 0 0 auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #0f4c75, #38bdf8);
+  color: #04121c;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.brand-text span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.symbol-box {
+  display: flex;
+  gap: 4px;
+}
+
+.symbol-box input,
+.symbol-box select {
+  width: 108px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #060c13;
+  color: var(--text);
+  font: inherit;
+}
+
+.symbol-box #targetSelect {
+  display: none;
+}
+
+.symbol-box #symbolSelect {
+  width: 174px;
+}
+
+.symbol-box #symbolInput {
+  width: 124px;
+}
+
+button {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #14212e;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--accent);
+}
+
+button.ghost {
+  background: transparent;
+}
+
+.admin-link {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.admin-link:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.readout {
+  display: flex;
+  gap: 11px;
+  margin: 0;
+}
+
+.readout div {
+  display: flex;
+  flex-direction: column;
+}
+
+.readout dt {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.readout dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.controls label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.controls select {
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #060c13;
+  color: var(--text);
+  font: inherit;
+}
+
+.controls .mode-control select {
+  min-width: 88px;
+  border-color: #315b79;
+}
+
+.controls select:disabled,
+.symbol-box select:disabled,
+.symbol-box input:disabled,
+.symbol-box button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.controls .contrast-control {
+  gap: 4px;
+}
+
+#heatContrast {
+  width: 68px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: ew-resize;
+}
+
+#heatContrastValue {
+  width: 30px;
+  color: #9bb4c8;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#bubbleFloor {
+  width: 124px;
+  font-variant-numeric: tabular-nums;
+}
+
+.help-dot {
+  display: inline-grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  border: 1px solid #355169;
+  border-radius: 50%;
+  color: #9bb4c8;
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+
+.controls .spacing-control input {
+  width: 64px;
+  height: 24px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #060c13;
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding: 0 4px;
+}
+
+.controls .spacing-control .unit {
+  color: var(--muted);
+}
+
+.controls .toggle {
+  color: var(--muted);
+}
+
+.badge {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+}
+
+.badge.live {
+  color: #7ff0b8;
+  border-color: #1d5b3d;
+  background: #0b2318;
+}
+
+.badge.waiting {
+  color: var(--warn);
+  border-color: #5a4318;
+  background: #201804;
+}
+
+.badge.bad {
+  color: #ff9aa5;
+  border-color: #632330;
+  background: #240b10;
+}
+
+/* --------------------------------------------------------------- workspace */
+
+.workspace {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+.chart-pane {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #04070b;
+}
+
+#chart {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 图表内的拖动由 Pointer Events 明确分流；不影响顶部控件或浏览器整体缩放。 */
+  touch-action: none;
+}
+
+.legend {
+  position: absolute;
+  left: 10px;
+  top: 6px;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 10px;
+  pointer-events: none;
+  text-shadow: 0 0 4px #04070b, 0 0 4px #04070b;
+}
+
+.legend .trade-contract {
+  padding-left: 9px;
+  border-left: 1px solid #31506a;
+  color: #9cc7df;
+  letter-spacing: 0.01em;
+}
+
+.swatch {
+  display: inline-block;
+  width: 22px;
+  height: 8px;
+  margin-right: 5px;
+  vertical-align: middle;
+  border-radius: 2px;
+}
+
+.swatch.heat {
+  background: linear-gradient(90deg, #071a2b, #1668a8, #7fe3ff, #ffffff);
+}
+
+.swatch.bid {
+  background: linear-gradient(90deg, #062016, #128a4a, #86efac);
+}
+
+.swatch.ask {
+  background: linear-gradient(90deg, #2a0c10, #c0394a, #fca5a5);
+}
+
+/* 气泡图例使用 ATAS 向柔和球面，不画额外外圈。 */
+.swatch.buy {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 64% 34%, #74f2cf 0%, #20c89f 16%, #0c9274 52%, #033532 100%);
+  box-shadow: 0 1px 3px rgba(1, 9, 11, 0.65);
+}
+
+.swatch.sell {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 64% 34%, #ff9ebc 0%, #f43e72 16%, #c51d50 52%, #410927 100%);
+  box-shadow: 0 1px 3px rgba(1, 9, 11, 0.65);
+}
+
+.swatch.line-bid {
+  height: 2px;
+  background: #2dd4a0;
+}
+
+.swatch.line-ask {
+  height: 2px;
+  background: #f85a50;
+}
+
+.gap-notice {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 12px;
+  border-radius: 5px;
+  border: 1px solid #6b3a12;
+  background: #241304;
+  color: #fbbf6b;
+}
+
+.history-notice {
+  position: absolute;
+  left: 10px;
+  bottom: 30px;
+  max-width: min(440px, calc(100% - 24px));
+  padding: 4px 9px;
+  border: 1px solid #4e3d19;
+  border-radius: 5px;
+  background: rgba(30, 22, 5, 0.9);
+  color: #e7c97a;
+  pointer-events: none;
+}
+
+.coverage-hint {
+  /* 右侧 128px DOM + 78px 价轴属于 Canvas 自己的固定信息区。
+     提示只允许占用左侧主图区，避免遮住 DOM 顶栏的 max / 买卖占比。 */
+  --chart-side-width: 206px;
+  position: absolute;
+  top: 10px;
+  right: calc(var(--chart-side-width) + 12px);
+  max-width: calc(100% - var(--chart-side-width) - 24px);
+  box-sizing: border-box;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid #1f3347;
+  background: rgba(8, 14, 22, 0.88);
+  color: #d7e3ef;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.hidden {
+  display: none;
+}
+
+/* --------------------------------------------------------------------- TAS */
+
+.tas-pane {
+  flex: 0 0 280px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--panel-2);
+  min-height: 0;
+}
+
+/* .tas-pane 的 display:flex 位于通用 .hidden 规则之后；复盘必须用更高
+   specificity 真正隐藏实时 TAS。 */
+.tas-pane.hidden {
+  display: none;
+}
+
+.tas-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tas-head strong {
+  margin-right: auto;
+}
+
+.tas-head label {
+  color: var(--muted);
+}
+
+.tas-head select {
+  width: 88px;
+  height: 22px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #060c13;
+  color: var(--text);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.tas-columns {
+  display: grid;
+  grid-template-columns: 72px minmax(72px, 1fr) minmax(84px, 1fr);
+  gap: 10px;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--line);
+  color: #5d7183;
+  font-size: 10px;
+}
+
+.tas-list {
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+.tas-row {
+  display: grid;
+  grid-template-columns: 72px minmax(72px, 1fr) minmax(84px, 1fr);
+  gap: 10px;
+  padding: 2px 10px;
+  border-bottom: 1px solid #0f1922;
+}
+
+.tas-row.buy {
+  color: #86efac;
+}
+
+.tas-row.sell {
+  color: #fca5a5;
+}
+
+.tas-row .time {
+  color: var(--muted);
+}
+
+.tas-row .price {
+  text-align: left;
+  padding-left: 2px;
+}
+
+.tas-row .amount {
+  text-align: right;
+}
+
+.tas-foot {
+  padding: 5px 8px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* --------------------------------------------------------------- statusbar */
+
+.statusbar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  padding: 5px 12px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.statusbar .notice {
+  margin-left: auto;
+  color: #5d7183;
+}
+
+/* 窄视口下优先保留主图、状态徽章和网格控件。 */
+@media (max-width: 1180px) {
+  .brand-text {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .readout div:nth-child(n + 3) {
+    display: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .topbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .workspace {
+    flex-direction: column;
+  }
+
+  .tas-pane {
+    flex: 0 0 150px;
+    width: 100%;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .coverage-hint {
+    /* 窄画布使用 96px DOM + 68px 价轴；提示仍留在主图区。 */
+    --chart-side-width: 164px;
+    top: 27px;
+    right: calc(var(--chart-side-width) + 8px);
+    left: auto;
+    max-width: calc(100% - var(--chart-side-width) - 16px);
+    font-size: 10px;
+  }
+
+  .legend {
+    right: 8px;
+    gap: 8px;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  /* 手机首屏只保留三种核心颜色说明；成交契约和买卖一线仍可从页脚、
+     实际图形辨认，避免它们与纵轴缩放提示在窄屏顶部互相覆盖。 */
+  .legend .trade-contract,
+  .legend span:nth-last-child(-n + 2) {
+    display: none;
+  }
+
+  .statusbar .notice {
+    display: none;
+  }
+}
+
+/* The sandbox header includes retention status; keep every control reachable
+   inside the exchange iframe instead of clipping desktop controls. */
+.topbar { flex-wrap: wrap; overflow: visible; }
+.controls { flex: 1 1 640px; flex-wrap: wrap; }
+#storageBadge { min-width: 20ch; font-variant-numeric: tabular-nums; }

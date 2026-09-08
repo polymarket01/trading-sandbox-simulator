@@ -11,11 +11,16 @@ from app.db.base import Base
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
-    __table_args__ = (Index("idx_ledger_user_asset_time", "user_id", "asset", "created_at"),)
+    __table_args__ = (
+        Index("idx_ledger_user_asset_time", "user_id", "asset", "created_at"),
+        Index("idx_ledger_related_order", "related_order_id"),
+        Index("idx_ledger_related_trade", "related_trade_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     entry_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    account_run_id: Mapped[str | None] = mapped_column(String(96))
     asset: Mapped[str] = mapped_column(String(16), nullable=False)
     change_type: Mapped[str] = mapped_column(String(32), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(36, 18), nullable=False)

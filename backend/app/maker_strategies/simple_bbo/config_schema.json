@@ -1,0 +1,21 @@
+{
+  "strategy_key": "SIMPLE_BBO",
+  "sections": [
+    {
+      "key": "runtime",
+      "label": "运行参数",
+      "fields": [
+        {
+          "path": "second_level_notional",
+          "label": "second_level_notional",
+          "kind": "number"
+        },
+        {
+          "path": "second_level_distance_bps",
+          "label": "second_level_distance_bps",
+          "kind": "number"
+        }
+      ]
+    }
+  ]
+}

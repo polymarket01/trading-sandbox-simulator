@@ -1,0 +1,34 @@
+{
+  "api_version": 1,
+  "strategy_key": "SIMPLE_BBO",
+  "display_name": "极简四档铺单",
+  "products": [
+    "SPOT",
+    "PERP"
+  ],
+  "account_slots": 1,
+  "executor": "managed",
+  "entrypoints": {
+    "default": "app.maker_strategies.simple_bbo.plugin:default_config",
+    "validate": "app.maker_strategies.simple_bbo.plugin:validate",
+    "preview": "app.maker_strategies.simple_bbo.plugin:preview",
+    "worker": "app.maker_strategies.simple_bbo.plugin:SimpleBBOWorker"
+  },
+  "parameters": [
+    {
+      "path": "second_level_notional",
+      "label": "二档每侧金额（USDT）",
+      "kind": "decimal",
+      "exclusive_minimum": "0",
+      "default": "1000000"
+    },
+    {
+      "path": "second_level_distance_bps",
+      "label": "二档距离（bps）",
+      "kind": "decimal",
+      "exclusive_minimum": "0",
+      "exclusive_maximum": "10000",
+      "default": "5"
+    }
+  ]
+}

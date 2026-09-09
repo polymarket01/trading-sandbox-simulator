@@ -172,7 +172,11 @@ class SimpleBBOWorker(MakerExecutionWorker):
                 if not self._rate_available():
                     return
                 await self._cancel(order)
-        pending = dict(wanted)
+        occupied = {self.slots.get(o["order_id"]) for o in self.orders}
+        # A new feed tick may interrupt each write. Missing/oldest slots must get
+        # their turn before refreshing the first bid again on a slower host.
+        pending = dict(sorted(wanted.items(), key=lambda item: (
+            item[0] in occupied, self.last_placed.get(item[0], 0))))
         while pending:
             progressed = False
             for slot, goal in list(pending.items()):

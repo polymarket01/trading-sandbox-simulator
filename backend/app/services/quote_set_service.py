@@ -109,6 +109,7 @@ class QuoteSetService:
         return lock
 
     def _writer_ready(self) -> bool:
+        self.runtime.engine.fault.check()
         writer = getattr(self.runtime, "persistence_writer", None)
         return (
             writer is not None
@@ -400,7 +401,7 @@ class QuoteSetService:
                 # This command envelope is intentionally not durable.  Preserve
                 # the last actual durable watermark instead of claiming the new
                 # exchange sequence was committed.
-                return {"durable_seq": writer.durable_sequence()}
+                return {"ephemeral": True, "ack_stage": "RECEIVED"}
             return await writer.append_command(record)
 
         async def execute(_command: ExchangeCommand, sequence: int, plan: list[dict[str, Any]]) -> dict:
@@ -463,13 +464,14 @@ class QuoteSetService:
                             quote_validation_context=quote_validation_context,
                         )
                     if result is None:
-                        raise RuntimeError("fast order path unavailable")
+                        raise OrderValidationError("fast order path unavailable")
                     self._assert_engine_result_accepted(result, action)
                     accepted_count += 1
                     flow = result.get("_fast_flow")
                     if isinstance(flow, dict):
                         flows.append(flow)
-                except (OrderValidationError, ContractValidationError, ValueError, RuntimeError) as exc:
+                except (OrderValidationError, ContractValidationError) as exc:
+                    self.runtime.engine.fault.check()
                     rejected_count += 1
                     error_text = str(exc)[:256]
                     category = self._classify_failure(error_text)
@@ -544,7 +546,8 @@ class QuoteSetService:
                             bbo_snapshot=bbo_snapshot,
                             include_orders=False,
                         )
-                except (OrderValidationError, ContractValidationError, ValueError, RuntimeError):
+                except (OrderValidationError, ContractValidationError):
+                    self.runtime.engine.fault.check()
                     return False
                 if not isinstance(result, dict):
                     return False
@@ -768,7 +771,7 @@ class QuoteSetService:
                 command_sequence=int(operation.get("sequence_number") or 0),
             )
             if result is None:
-                raise RuntimeError("fast order path unavailable")
+                raise OrderValidationError("fast order path unavailable")
             return result
         return None
 
@@ -826,7 +829,7 @@ class QuoteSetService:
                     command_sequence=int(operation.get("sequence_number") or 0),
                 )
                 if result is None:
-                    raise RuntimeError("fast order path unavailable")
+                    raise OrderValidationError("fast order path unavailable")
                 return result
             else:
                 return None

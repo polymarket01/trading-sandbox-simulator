@@ -30,6 +30,7 @@ from app.multiprocess.alerts import AlertAggregator
 
 MARKETS = ("BTCUSDT", "BTCUSDT-PERP")
 MARKET_BY_COMPONENT = {"spot_engine": "BTCUSDT", "perp_engine": "BTCUSDT-PERP"}
+COMPONENT_BY_MARKET = {market: component for component, market in MARKET_BY_COMPONENT.items()}
 
 
 def _queue_size(queue: Any) -> int:
@@ -268,6 +269,10 @@ class GatewayState:
         if not process.get("alive", False) or heartbeat_age is None or heartbeat_age > self.thresholds["heartbeat_stale_ms"]:
             engine_status = "HALTED"
             reasons.append("worker heartbeat stale or process not alive")
+        matching_gate = (heartbeat.get("runtime") or {}).get("matching_gate") or {}
+        if matching_gate.get("halted"):
+            engine_status = "HALTED"
+            reasons.append(str(matching_gate.get("reason") or "matching write gate halted"))
         worker_status = engine_status
         if str(reference.get("status") or "missing").lower() != "fresh" or reference_age is None or reference_age > self.thresholds["reference_stale_ms"]:
             worker_status = "DEGRADED" if worker_status != "HALTED" else worker_status
@@ -276,6 +281,7 @@ class GatewayState:
             "status": worker_status,
             "worker_status": worker_status,
             "engine_status": engine_status,
+            "matching_gate": matching_gate,
             "pid": process.get("pid") or heartbeat.get("pid"),
             "restart_count": int((self.metrics_snapshot.get("worker_restarts") or {}).get(component, 0)),
             "heartbeat_age_ms": heartbeat_age,
@@ -350,6 +356,12 @@ class GatewayState:
                 }
             if original is not None:
                 return original.public()
+
+        heartbeat = (self.metrics_snapshot.get("heartbeats") or {}).get(COMPONENT_BY_MARKET.get(market)) or {}
+        matching_gate = (heartbeat.get("runtime") or {}).get("matching_gate") or {}
+        if matching_gate.get("halted"):
+            return {"status": "NOT_EXECUTED", "command_id": command_id, "market_id": market,
+                    "reason": matching_gate.get("reason"), "matching_gate": matching_gate}
 
         sequence, priority = self._next_sequences(request.priority_sequence)
         timestamp = now_ms()

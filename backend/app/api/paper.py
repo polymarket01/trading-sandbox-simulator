@@ -354,6 +354,7 @@ async def get_brand(session: AsyncSession = Depends(get_db_session)):
     row = await session.scalar(select(PaperBrandConfig).where(PaperBrandConfig.id == 1))
     return {
         "brand": {
+            "registration_enabled": bool(settings.paper_exchange_register_enabled),
             "exchange_name": row.exchange_name if row else "Paper Exchange",
             "logo_url": row.logo_url if row else None,
             "favicon_url": row.favicon_url if row else None,

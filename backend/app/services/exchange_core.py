@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections import Counter, OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -14,7 +15,8 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from app.core.constants import SIDE_BUY, SIDE_SELL
-from app.services.matching_engine import BookOrder, MatchingEngine
+from app.services.matching_engine import BookOrder, MatchingEngine, MarketBook
+from app.services.matching_faults import BusinessRejected, NotExecuted, MatchingHalted, BookInvariantError
 from exchange_common.quote_pipeline import LatencyTracker
 from app.services.causal_contracts import CommandEnvelope
 
@@ -157,7 +159,7 @@ class CoreAck:
     failure_samples: tuple[str, ...] = ()
     failure_categories: tuple[tuple[str, int], ...] = ()
     quote_patch_duration_ms: float | None = None
-    ack_stage: str = "DURABLE"
+    ack_stage: str = "EXECUTED"
     epoch: str = ""
     command_sequence: int = 0
     priority_sequence: int = 0
@@ -247,6 +249,7 @@ class ExchangeCore:
         mode: str = "legacy",
     ) -> None:
         self.engine = engine or MatchingEngine()
+        self.fault = self.engine.fault
         self.epoch = str(epoch or f"exchange-{uuid4().hex}")
         self.mode = str(mode or "legacy").lower()
         self._next_sequence = max(0, int(sequence_start))
@@ -266,7 +269,9 @@ class ExchangeCore:
         self._watermarks = {
             "ingress_seq": self._next_sequence,
             "matched_seq": self._next_sequence,
-            "durable_seq": self._next_sequence,
+            "durable_seq": 0,
+            "journaled_seq_max": 0,
+            "journaled_seq_contiguous": 0,
             "materialized_seq": 0,
             "published_seq": 0,
         }
@@ -304,7 +309,7 @@ class ExchangeCore:
     def start(self) -> None:
         if self._worker_task is None or self._worker_task.done():
             self._stopping = False
-            self._metrics["status"] = "HEALTHY"
+            self._metrics["status"] = "HALTED" if self.fault.halted else "HEALTHY"
             self._worker_task = asyncio.create_task(self._run(), name="exchange-core")
 
     async def stop(self) -> None:
@@ -314,6 +319,7 @@ class ExchangeCore:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
         self._worker_task = None
+        self._drain_not_executed("core stopped before execution")
 
     def _priority(self, command: ExchangeCommand) -> int:
         if command.priority is not None:
@@ -393,7 +399,7 @@ class ExchangeCore:
             changed_count=0,
             noop_count=0,
             first_error=reason,
-            exchange_sequence=self._next_sequence,
+            exchange_sequence=0,
             durable_sequence=self._watermarks["durable_seq"],
             matched_sequence=self._watermarks["matched_seq"],
             duration_ms=0.0,
@@ -402,9 +408,9 @@ class ExchangeCore:
             dropped=True,
             operation_counts=(),
             failure_samples=(reason,) if self._failure_sample_limit else (),
-            ack_stage=status if status in {"REJECTED", "IDEMPOTENCY_CONFLICT", "UNKNOWN_TIMEOUT", "UNKNOWN_AFTER_RESTART"} else "DURABLE",
+            ack_stage=status if status in {"REJECTED", "IDEMPOTENCY_CONFLICT", "UNKNOWN_TIMEOUT", "UNKNOWN_AFTER_RESTART"} else "NOT_EXECUTED",
             epoch=command.epoch or self.epoch,
-            command_sequence=self._next_sequence,
+            command_sequence=0,
             causal_watermarks=self.watermarks_snapshot(),
         )
 
@@ -487,11 +493,11 @@ class ExchangeCore:
             failure_samples=tuple(samples),
             failure_categories=tuple(sorted((key, value) for key, value in categories.items() if value)),
             quote_patch_duration_ms=quote_patch_duration_ms,
-            ack_stage=str(result.get("ack_stage") or "DURABLE"),
+            ack_stage="EXECUTED",
             epoch=command.epoch or self.epoch,
             command_sequence=sequence,
-            priority_sequence=int(result.get("priority_sequence") or sequence),
-            execution_sequence=int(result.get("execution_sequence") or sequence),
+            priority_sequence=int(result.get("priority_sequence") or 0),
+            execution_sequence=int(result.get("execution_sequence") or 0),
             published_sequence=int(result.get("published_sequence") or self._watermarks["published_seq"]),
             causal_watermarks=self.watermarks_snapshot(),
         )
@@ -530,9 +536,11 @@ class ExchangeCore:
         existing = self._idempotency_lookup(command, fingerprint)
         if existing is not None:
             if isinstance(existing, asyncio.Future):
-                return await existing
+                return await asyncio.shield(existing)
             return existing
 
+        if self.fault.halted:
+            return self._system_ack(command, status="NOT_EXECUTED", reason=f"matching HALTED (instance): {self.fault.reason}")
         self._next_sequence += 1
         sequence = self._next_sequence
         self._watermarks["ingress_seq"] = sequence
@@ -544,7 +552,6 @@ class ExchangeCore:
             previous = self._latest_generation.get(key)
             if previous is not None and generation <= previous:
                 self._metrics["quote_set_dropped"] += 1
-                print(f"QUOTE_DROP {key} generation={generation} previous={previous}", flush=True)
                 ack = CoreAck(
                     command_id=command.command_id,
                     request_fingerprint=fingerprint,
@@ -559,6 +566,7 @@ class ExchangeCore:
                     duration_ms=0.0,
                     result_hash=payload_hash({"reason": "latest_wins"}),
                     status="DROPPED_STALE_GENERATION",
+                    ack_stage="NOT_EXECUTED",
                     dropped=True,
                     operation_counts=(),
                     failure_samples=(),
@@ -586,9 +594,9 @@ class ExchangeCore:
         except asyncio.QueueFull as exc:
             self._pending_acks.pop(command.command_id, None)
             self._metrics["status"] = "DEGRADED"
-            raise RuntimeError("exchange command queue is full") from exc
+            return self._system_ack(command, status="NOT_EXECUTED", reason="exchange command queue is full")
         self._refresh_queue_metrics()
-        return await future
+        return await asyncio.shield(future)
 
     async def submit_quote_set(
         self,
@@ -612,8 +620,10 @@ class ExchangeCore:
             _priority, _sequence, queued = await self._queue.get()
             started = monotonic()
             self._stage_latency.observe("queue_age", (started - queued.received_at) * 1000)
+            executing = False
             try:
                 command = queued.command
+                self.fault.check()
                 if command.command_type == QUOTE_SET_REPLACE:
                     key = self._quote_state_key(command)
                     latest = self._latest_generation.get(key, int(command.generation or 0))
@@ -632,6 +642,7 @@ class ExchangeCore:
                             duration_ms=round(max(0.0, (monotonic() - started) * 1000), 3),
                             result_hash=payload_hash({"reason": "newer_generation_queued"}),
                             status="DROPPED_SUPERSEDED",
+                            ack_stage="NOT_EXECUTED",
                             dropped=True,
                             operation_counts=(),
                             failure_samples=(),
@@ -639,7 +650,8 @@ class ExchangeCore:
                         self._metrics["quote_set_dropped"] += 1
                         self._store_ack(command.command_id, command.request_fingerprint(), ack)
                         self._pending_acks.pop(command.command_id, None)
-                        queued.future.set_result(ack)
+                        if not queued.future.done():
+                            queued.future.set_result(ack)
                         continue
 
                 operation_plan = queued.operation_plan if queued.operation_plan is not None else []
@@ -672,11 +684,20 @@ class ExchangeCore:
                     ).as_dict()
                 )
                 if queued.before_execute is not None:
-                    durable = await queued.before_execute(record)
-                    durable_sequence = self._durable_sequence(durable, queued.sequence)
-                else:
-                    durable_sequence = queued.sequence
-                self._watermarks["durable_seq"] = max(self._watermarks["durable_seq"], durable_sequence)
+                    receipt = await queued.before_execute(record)
+                    if receipt is not None and not (isinstance(receipt, dict) and receipt.get("ephemeral") is True):
+                        if not self._journal_receipt_valid(receipt, command.command_id, queued.sequence):
+                            raise NotExecuted("invalid journal receipt; command not executed")
+                        self._watermarks["journaled_seq_max"] = max(self._watermarks["journaled_seq_max"], queued.sequence)
+                        if queued.sequence == self._watermarks["journaled_seq_contiguous"] + 1:
+                            self._watermarks["journaled_seq_contiguous"] = queued.sequence
+                    elif receipt is None:
+                        raise NotExecuted("missing journal receipt; command not executed")
+                # A journal intent is not a durable execution. External callbacks
+                # own financial persistence and its separate causal clock.
+                durable_sequence = self._watermarks["durable_seq"]
+                self.fault.check()
+                executing = True
 
                 engine_started = monotonic()
                 if queued.execute is not None:
@@ -708,30 +729,54 @@ class ExchangeCore:
                     # total CoreAck duration separately for request/queue
                     # diagnostics; this stage is the <20ms execution target.
                     self._stage_latency.observe("quote_patch", engine_duration_ms)
-                    self._refresh_quote_set_latency_metrics()
-                queued.future.set_result(ack)
+                if not queued.future.done():
+                    queued.future.set_result(ack)
             except asyncio.CancelledError:
+                if executing:
+                    self.mark_halted("core stopped during execution; result unknown")
+                self._finish_failure(queued, "UNKNOWN" if executing else "NOT_EXECUTED", "core worker stopped")
                 raise
             except Exception as exc:
-                self._halt_reason = str(exc)
-                self._metrics["status"] = "HALTED"
-                self._pending_acks.pop(queued.command.command_id, None)
-                if not queued.future.done():
-                    queued.future.set_exception(exc)
+                if isinstance(exc, BusinessRejected) and not self.fault.halted:
+                    status = "NOT_EXECUTED" if isinstance(exc, NotExecuted) else "REJECTED"
+                elif not executing:
+                    # Even unexpected journal failures cannot have matched this command.
+                    status = "NOT_EXECUTED"
+                else:
+                    self.mark_halted(str(exc))
+                    status = "UNKNOWN"
+                self._finish_failure(queued, status, str(exc))
             finally:
                 self._metrics["event_loop_lag_ms"] = max(0, int((monotonic() - started) * 1000))
                 self._queue.task_done()
                 self._refresh_queue_metrics()
 
     @staticmethod
-    def _durable_sequence(value: dict[str, Any] | int | None, fallback: int) -> int:
-        if isinstance(value, int):
-            return value
-        if isinstance(value, dict):
-            for key in ("durable_seq", "exchange_sequence", "event_sequence"):
-                if value.get(key) is not None:
-                    return int(value[key])
-        return fallback
+    def _journal_receipt_valid(value, command_id, sequence):
+        return (
+            isinstance(value, dict)
+            and value.get("ack_stage") == "JOURNALED"
+            and value.get("sequence_domain") == "exchange_core_ingress"
+            and value.get("command_id") == command_id
+            and type(value.get("exchange_sequence")) is int
+            and value["exchange_sequence"] == sequence
+        )
+
+    def _finish_failure(self, queued, status, reason):
+        ack = replace(self._system_ack(queued.command, status=status, reason=reason),
+                      exchange_sequence=queued.sequence, command_sequence=queued.sequence,
+                      ack_stage=status, rejected_count=0 if status == "UNKNOWN" else 1,
+                      dropped=status == "NOT_EXECUTED")
+        self._store_ack(queued.command.command_id, queued.command.request_fingerprint(), ack)
+        self._pending_acks.pop(queued.command.command_id, None)
+        if not queued.future.done():
+            queued.future.set_result(ack)
+
+    def _drain_not_executed(self, reason):
+        while not self._queue.empty():
+            _, _, queued = self._queue.get_nowait()
+            self._finish_failure(queued, "NOT_EXECUTED", reason)
+            self._queue.task_done()
 
     # ------------------------------------------------------------------
     # deterministic quote expansion and state
@@ -1000,14 +1045,15 @@ class ExchangeCore:
         self._metrics["trade_events"] += 1
 
     def mark_halted(self, reason: str) -> None:
-        self._halt_reason = str(reason)
+        self.fault.halt(reason)
+        self._halt_reason = self.fault.reason
         self._metrics["status"] = "HALTED"
 
-    def _refresh_queue_metrics(self) -> None:
+    def _refresh_queue_metrics(self, *, include_oldest: bool = False) -> None:
         self._metrics["command_queue_depth"] = self._queue.qsize()
         if self._queue.empty():
             self._metrics["command_queue_oldest_ms"] = 0
-        else:
+        elif include_oldest:
             try:
                 oldest = min(item[2].received_at for item in self._queue._queue)  # type: ignore[attr-defined]
             except (AttributeError, ValueError):
@@ -1023,21 +1069,24 @@ class ExchangeCore:
         return round(float(ordered[index]), 3)
 
     def _refresh_quote_set_latency_metrics(self) -> None:
-        values = list(self._quote_set_latency_ms)
-        self._metrics["quote_set_p50_ms"] = self._percentile(values, 50)
-        self._metrics["quote_set_p95_ms"] = self._percentile(values, 95)
-        self._metrics["quote_set_p99_ms"] = self._percentile(values, 99)
+        values = sorted(self._quote_set_latency_ms)
+        for percentile in (50, 95, 99):
+            index = min(len(values) - 1, max(0, int(round(percentile / 100 * (len(values) - 1)))))
+            self._metrics[f"quote_set_p{percentile}_ms"] = round(values[index], 3) if values else 0.0
 
     def watermarks_snapshot(self) -> dict[str, int]:
         return {key: int(value) for key, value in self._watermarks.items()}
 
     def metrics_snapshot(self) -> dict[str, Any]:
-        self._refresh_queue_metrics()
+        self._refresh_queue_metrics(include_oldest=True)
+        self._refresh_quote_set_latency_metrics()
+        if self.fault.halted:
+            self._metrics["status"] = "HALTED"
         self._refresh_ack_cache_metrics()
         watermarks = self.watermarks_snapshot()
         command_depth = int(self._metrics["command_queue_depth"])
-        materialization_lag = max(0, watermarks["durable_seq"] - watermarks["materialized_seq"])
-        matched_durable_lag = max(0, watermarks["matched_seq"] - watermarks["durable_seq"])
+        materialization_lag = 0  # Legacy incomparable fields; writer owns actual lag.
+        matched_durable_lag = 0  # Memory/ephemeral execution is not durable backlog.
         published_lag = max(0, watermarks["matched_seq"] - watermarks["published_seq"])
         healthy = self._metrics["status"] not in {"HALTED", "DEGRADED"}
         # ExchangeCore command sequences and the persistence event-log IDs are
@@ -1058,85 +1107,123 @@ class ExchangeCore:
             "matched_durable_lag": matched_durable_lag,
             "published_lag": published_lag,
             "latency": self._stage_latency.snapshot(),
-            "halt_reason": self._halt_reason,
+            "halt_reason": self.fault.reason,
+            "matching_gate": self.fault.snapshot(),
+            "pending_ack_count": len(self._pending_acks),
+            "watermark_semantics": "core ingress maxima; journal contiguous is conservative lower bound; financial durable/materialized are separate clocks",
             "watcher_restart_allowed": restart_allowed,
             "watcher_restart_gate_reason": None if restart_allowed else "exchange_congestion_or_halted",
         }
 
+    MATCHING_RULES = {"price_time": "linked_fifo_v1", "amend": "shrink_keep_increase_reprice_tail_v1",
+                      "stp": "self_trade_policy_v1", "numeric": "decimal_v1"}
+
     def snapshot_state(self) -> dict[str, Any]:
-        books: dict[str, Any] = {}
+        books = {}
         for symbol, book in self.engine.books.items():
             books[symbol] = {
+                "mutation_version": book.mutation_version,
                 "orders": [
-                    {
-                        "order_id": node.order_id,
-                        "user_id": node.user_id,
-                        "side": node.side,
-                        "price": str(node.price),
-                        "remaining": str(node.remaining),
-                        "created_at": node.created_at.astimezone(UTC).isoformat(),
-                        "sequence_number": int(node.sequence_number),
-                    }
-                    for node in book.orders.values()
-                ]
+                    {"order_id": n.order_id, "user_id": n.user_id, "side": n.side,
+                     "price": str(n.price), "remaining": str(n.remaining),
+                     "created_at": n.created_at.isoformat(), "sequence_number": n.sequence_number,
+                     "stp_account_key": n.stp_account_key, "stp_group_key": n.stp_group_key,
+                     "stp_is_bot": n.stp_is_bot, "stp_mode": n.stp_mode}
+                    for n in book.iter_fifo_nodes()
+                ],
             }
-        return {
-            "schema_version": 1,
-            "watermarks": self.watermarks_snapshot(),
-            "next_sequence": self._next_sequence,
-            "latest_generation": {
-                f"{symbol}|{account_id}|{strategy}": generation
-                for (symbol, account_id, strategy), generation in self._latest_generation.items()
-            },
-            "quote_orders": self._quote_orders,
-            "books": books,
-            "config_version": "runtime",
-        }
+        return {"schema_version": 2, "matching_rules": dict(self.MATCHING_RULES),
+                "watermarks": self.watermarks_snapshot(), "next_sequence": self._next_sequence,
+                "latest_generation": {f"{s}|{u}|{strategy}": g for (s,u,strategy),g in self._latest_generation.items()},
+                "quote_orders": deepcopy(self._quote_orders), "books": books, "config_version": "runtime"}
 
     def state_hash(self) -> str:
         return payload_hash(self.snapshot_state())
 
     def restore_state(self, snapshot: dict[str, Any], *, restore_books: bool = True) -> None:
-        self._next_sequence = max(self._next_sequence, int(snapshot.get("next_sequence") or 0))
-        watermarks = snapshot.get("watermarks") if isinstance(snapshot.get("watermarks"), dict) else {}
-        for key in self._watermarks:
-            if watermarks.get(key) is not None:
-                self._watermarks[key] = max(self._watermarks[key], int(watermarks[key]))
-        self._latest_generation = {}
+        """Cold restore, validate/build before swap. Never unlocks the fault latch.
+
+        Schema 1 permits metadata only: it did not preserve FIFO or STP. Schema
+        2 covers matcher rules, not external risk/fee/config replay authority.
+        """
+        candidate_books = {}
+        if restore_books:
+            if snapshot.get("schema_version") != 2 or snapshot.get("matching_rules") != self.MATCHING_RULES:
+                raise ValueError("full matching restore requires FIFO/STP schema 2 and matching rules")
+            for symbol, payload in snapshot["books"].items():
+                book = MarketBook()
+                for raw in payload["orders"]:
+                    order = BookOrder(
+                        order_id=raw["order_id"], user_id=int(raw["user_id"]), side=raw["side"],
+                        price=Decimal(raw["price"]), remaining=Decimal(raw["remaining"]),
+                        created_at=datetime.fromisoformat(raw["created_at"]), sequence_number=int(raw["sequence_number"]),
+                        stp_account_key=raw["stp_account_key"], stp_group_key=raw["stp_group_key"],
+                        stp_is_bot=raw["stp_is_bot"], stp_mode=raw["stp_mode"],
+                    )
+                    if (not isinstance(order.order_id, str) or not order.order_id or order.order_id in book.orders
+                        or order.side not in {SIDE_BUY, SIDE_SELL} or not order.price.is_finite()
+                        or not order.remaining.is_finite() or order.price <= 0 or order.remaining <= 0
+                        or type(order.stp_is_bot) is not bool
+                        or order.stp_mode not in {"cancel_taker", "cancel_maker", "decrement_and_cancel", "reject", "allow"}
+                        or order.sequence_number < 0):
+                        raise ValueError("invalid full matching snapshot order")
+                    book.add_resting_order(order)
+                book.mutation_version = int(payload["mutation_version"])
+                if book.mutation_version < 0:
+                    raise ValueError("invalid mutation version")
+                book.validate_invariants()
+                candidate_books[str(symbol)] = book
+        # Build all metadata before modifying live state as well.
+        next_sequence = max(self._next_sequence, int(snapshot.get("next_sequence") or 0))
+        watermarks = dict(self._watermarks)
+        for key, value in (snapshot.get("watermarks") or {}).items():
+            if key in watermarks:
+                # Legacy schema durable_seq was often fabricated from ingress.
+                if snapshot.get("schema_version") == 1 and key == "durable_seq":
+                    continue
+                watermarks[key] = max(watermarks[key], int(value))
+        generations = {}
         for key, value in (snapshot.get("latest_generation") or {}).items():
-            if "|" not in str(key):
-                continue
-            parts = str(key).split("|", 2)
-            if len(parts) != 3:
-                continue
-            symbol, account_id, strategy = parts
-            self._latest_generation[(symbol, int(account_id), strategy)] = max(
-                self._latest_generation.get((symbol, int(account_id), strategy), 0), int(value)
-            )
-        self._quote_orders = json.loads(json.dumps(snapshot.get("quote_orders") or {}, default=str))
-        if not restore_books:
-            self._metrics["status"] = "HEALTHY"
-            return
-        for symbol in list(self.engine.books):
-            self.engine.clear_market(symbol)
-        for symbol, book_payload in (snapshot.get("books") or {}).items():
-            for raw in book_payload.get("orders", []) if isinstance(book_payload, dict) else []:
-                self.engine.load_resting_order(
-                    symbol,
-                    BookOrder(
-                        order_id=str(raw["order_id"]),
-                        user_id=int(raw["user_id"]),
-                        side=str(raw["side"]),
-                        price=Decimal(str(raw["price"])),
-                        remaining=Decimal(str(raw["remaining"])),
-                        created_at=datetime.fromisoformat(str(raw["created_at"])),
-                        sequence_number=int(raw.get("sequence_number") or 0),
-                    ),
-                )
+            symbol, account_id, strategy = str(key).split("|", 2)
+            generations[(symbol, int(account_id), strategy)] = int(value)
+        quote_orders = deepcopy(snapshot.get("quote_orders") or {})
+        if restore_books:
+            for book in candidate_books.values():
+                book.fault = self.fault
+            self.engine.books = candidate_books
+        self._next_sequence, self._watermarks = next_sequence, watermarks
+        self._latest_generation, self._quote_orders = generations, quote_orders
+        self._metrics["status"] = "HALTED" if self.fault.halted else "HEALTHY"
+
+    def recover_authoritative(self, snapshot, *, validate_external):
+        """Explicit offline recovery; caller must quiesce all engine consumers.
+
+        validate_external(candidate_engine) must verify authoritative financial
+        state and return True. Metadata restoration/start never calls this.
+        No automatic repair, retry, replay or service endpoint is provided.
+        """
+        if self._worker_task is not None or self._pending_acks or not self._queue.empty():
+            raise ValueError("stop/drain core before authoritative recovery")
+        if any(seq._worker_task is not None or not seq._queue.empty() or seq._inline_owner is not None
+               for seq in self.engine.sequencers):
+            raise ValueError("stop/drain all symbol sequencers before authoritative recovery")
+        if not self.fault.halted:
+            self.mark_halted("explicit authoritative recovery in progress")
+        revision = self.fault.revision
+        candidate = ExchangeCore(sequence_start=0)
+        candidate.restore_state(snapshot)
+        if validate_external(candidate.engine) is not True:
+            raise ValueError("authoritative external recovery validation failed")
+        if revision != self.fault.revision:
+            raise ValueError("fault changed during recovery")
+        self.restore_state(candidate.snapshot_state())
+        self.fault.halted = False
+        self.fault.reason = self.fault.category = None
+        self._halt_reason = None
         self._metrics["status"] = "HEALTHY"
 
     def replay_quote_set(self, command_record: dict[str, Any]) -> dict[str, Any]:
-        """Replay a journal record without touching I/O or wall-clock time."""
+        """Recover quote-management metadata only; not matching or financial replay."""
         command = ExchangeCommand(
             command_id=str(command_record["command_id"]),
             command_type=str(command_record.get("command_type") or QUOTE_SET_REPLACE),
@@ -1152,12 +1239,10 @@ class ExchangeCore:
         operations = list(command_record.get("operations") or command.payload.get("operations") or [])
         state_key = self._quote_state_key(command)
         generation = int(command.generation or 0)
-        print(f"QUOTE_REPLAY {state_key} generation={generation} prev={self._latest_generation.get(state_key, 0)}", flush=True)
         self._latest_generation[state_key] = max(self._latest_generation.get(state_key, 0), generation)
         self._record_quote_operations(command, operations)
         sequence = int(command_record.get("exchange_sequence") or self._next_sequence)
         self._next_sequence = max(self._next_sequence, sequence)
         self._watermarks["ingress_seq"] = max(self._watermarks["ingress_seq"], sequence)
-        self._watermarks["durable_seq"] = max(self._watermarks["durable_seq"], sequence)
         self._watermarks["matched_seq"] = max(self._watermarks["matched_seq"], sequence)
         return {"replayed": True, "operation_count": len(operations), "exchange_sequence": sequence}

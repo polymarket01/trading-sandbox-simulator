@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.matching_faults import BusinessRejected, MatchingHalted, BookInvariantError
+
 import asyncio
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -44,9 +46,9 @@ def _decimal(value: Any, *, field: str) -> Decimal:
     try:
         result = Decimal(str(value))
     except Exception as exc:
-        raise ValueError(f"invalid decimal {field}") from exc
+        raise BusinessRejected(f"invalid decimal {field}") from exc
     if not result.is_finite():
-        raise ValueError(f"non-finite decimal {field}")
+        raise BusinessRejected(f"non-finite decimal {field}")
     return result
 
 
@@ -193,6 +195,7 @@ class EngineWorkerRuntime:
 
         self.metrics["commands"] += 1
         try:
+            self.engine.fault.check()
             if envelope.kind in {"MAKER_PLAN", "QUOTE_PATCH"} and self.maker_paused:
                 result = self._system_result(envelope, "REJECTED_MAKER_PAUSED", "maker ingress is paused by runtime readiness gate")
             elif envelope.kind == "PLACE":
@@ -214,8 +217,14 @@ class EngineWorkerRuntime:
                 result = self._system_result(envelope, "ACKED", "maker plan ingress resumed")
             else:
                 result = self._system_result(envelope, "REJECTED", f"unsupported command kind: {envelope.kind}")
-        except Exception as exc:
+        except MatchingHalted as exc:
+            result = self._system_result(envelope, "NOT_EXECUTED", str(exc))
+        except BusinessRejected as exc:
             result = self._system_result(envelope, "REJECTED", str(exc))
+        except Exception as exc:
+            self.engine.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            result = self._system_result(envelope, "UNKNOWN", str(exc))
+        result["matching_gate"] = self.engine.fault.snapshot()
         result.setdefault("command_id", envelope.command_id)
         result.setdefault("request_fingerprint", envelope.request_fingerprint)
         result.setdefault("market_id", self.market_id)
@@ -259,11 +268,11 @@ class EngineWorkerRuntime:
             return result
         side = str(payload.get("side") or "").lower()
         if side not in {"buy", "sell"}:
-            raise ValueError("side must be buy or sell")
+            raise BusinessRejected("side must be buy or sell")
         price = _decimal(payload.get("price"), field="price")
         quantity = _decimal(payload.get("quantity"), field="quantity")
         if price <= 0 or quantity <= 0:
-            raise ValueError("price and quantity must be positive")
+            raise BusinessRejected("price and quantity must be positive")
         order_id = str(payload.get("order_id") or f"{self.market_id}-{uuid4().hex}")
         sequenced = self.sequencer._execute(
             NewOrderCommand(
@@ -322,7 +331,7 @@ class EngineWorkerRuntime:
     def _cancel(self, envelope: IPCEnvelope) -> dict[str, Any]:
         order_id = str(envelope.payload.get("order_id") or "")
         if not order_id:
-            raise ValueError("order_id is required")
+            raise BusinessRejected("order_id is required")
         metadata = self.order_index.get(order_id)
         sequenced = self.sequencer._execute(CancelOrderCommand(order_id=order_id))
         if sequenced.cancelled_side is None:
@@ -351,11 +360,11 @@ class EngineWorkerRuntime:
         payload = envelope.payload
         order_id = str(payload.get("order_id") or "")
         if not order_id:
-            raise ValueError("order_id is required")
+            raise BusinessRejected("order_id is required")
         price = _decimal(payload.get("price"), field="price")
         quantity = _decimal(payload.get("quantity"), field="quantity")
         if price <= 0 or quantity <= 0:
-            raise ValueError("price and quantity must be positive")
+            raise BusinessRejected("price and quantity must be positive")
         sequenced = self.sequencer._execute(
             AmendOrderCommand(order_id=order_id, new_price=price, new_remaining=quantity)
         )
@@ -400,7 +409,13 @@ class EngineWorkerRuntime:
                 "changed_count": patch.changed_count,
                 "rejected_count": patch.rejected_count,
                 "operation_counts": dict(patch.operation_counts),
-                "fills": self._fills(patch.fills, taker_user_id=0, taker_side="buy"),
+                "fills": [
+                    {**self._fills([fill], taker_user_id=taker[1], taker_side=taker[2])[0],
+                     "taker_order_id": taker[0], "taker_side": taker[2]}
+                    for fill, taker in zip(patch.fills, patch.fill_takers, strict=True)
+                ],
+                "stp_intercept_count": patch.stp_intercept_count,
+                "stp_decremented_quantity": str(patch.stp_decremented_quantity),
             }
         )
         self._validate_invariants()
@@ -476,11 +491,11 @@ class EngineWorkerRuntime:
 
     def _coerce_patch_operation(self, item: Any, envelope: IPCEnvelope) -> BulkQuotePatchOperation:
         if not isinstance(item, dict):
-            raise ValueError("quote patch operation must be an object")
+            raise BusinessRejected("quote patch operation must be an object")
         action = str(item.get("action") or "").lower()
         order_id = str(item.get("order_id") or "")
         if not order_id:
-            raise ValueError("quote patch order_id is required")
+            raise BusinessRejected("quote patch order_id is required")
         return BulkQuotePatchOperation(
             action=action,
             order_id=order_id,
@@ -542,7 +557,7 @@ class EngineWorkerRuntime:
             book = self.engine.ensure_market(self.market_id)
             book.validate_invariants()
             if not set(self.order_index).issubset(set(book.orders)):
-                raise ValueError("order metadata points outside the engine book")
+                raise BookInvariantError("order metadata points outside the engine book")
         except Exception:
             self.metrics["invariant_failures"] += 1
             raise
@@ -598,6 +613,8 @@ class EngineWorkerRuntime:
         return tuple(changes)
 
     def published_event(self, *, force_snapshot: bool = False) -> PublishedBookEvent | None:
+        if self.engine.fault.halted:
+            return None
         snapshot = self.engine.snapshot(self.market_id)
         if not force_snapshot and snapshot == self._last_book:
             return None
@@ -802,7 +819,7 @@ def engine_worker_main(
                     "references": _queue_size(reference_queue),
                     "control": _queue_size(control_queue),
                 },
-                "runtime": dict(runtime.metrics),
+                "runtime": {**runtime.metrics, "matching_gate": runtime.engine.fault.snapshot()},
                 "book_seq": runtime.publish_seq,
                 "stream_id": runtime.stream_id,
                 "last_book_progress_at": runtime.last_book_progress_at,

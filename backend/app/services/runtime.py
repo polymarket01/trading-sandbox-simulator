@@ -6,6 +6,7 @@ import os
 import time
 from collections import OrderedDict, defaultdict, deque
 from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -47,6 +48,9 @@ class PublishedOrderBook:
     depth_views: tuple[tuple[int, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]], ...] = ()
     snapshot_wire_cache: tuple[tuple[int, str], ...] = ()
     stream_epoch: str = ""
+
+
+_financial_turn_checkpoint: ContextVar = ContextVar("financial_turn_checkpoint", default=None)
 
 
 class AppRuntime:
@@ -200,17 +204,66 @@ class AppRuntime:
     async def market_financial_guard(self, symbol: str, key_loader) -> None:
         """Serialize a market mutation, then lock every account it can settle."""
         normalized = symbol.upper()
+        self.engine.fault.check()
         async with self.market_locks[normalized]:
+            self.engine.fault.check()
             task = asyncio.current_task()
             if task is not None:
                 self.market_lock_owners[normalized] = task
             try:
                 keys = await key_loader()
                 async with self.financial_resources(keys):
-                    yield
+                    self.engine.fault.check()
+                    book = self.engine.books.get(normalized)
+                    version = [book.mutation_version if book is not None else 0]
+                    checkpoint_token = _financial_turn_checkpoint.set((self, normalized, version))
+                    try:
+                        yield
+                    except BaseException as exc:
+                        current = self.engine.books.get(normalized)
+                        if (current.mutation_version if current is not None else 0) != version[0]:
+                            self.engine.fault.halt(f"financial turn failed after matching: {exc}")
+                        raise
+                    finally:
+                        _financial_turn_checkpoint.reset(checkpoint_token)
             finally:
                 if task is not None and self.market_lock_owners.get(normalized) is task:
                     self.market_lock_owners.pop(normalized, None)
+
+    def acknowledge_committed_lifecycle(self, symbol: str) -> None:
+        """Only the guard owner may checkpoint a confirmed standalone cancel.
+
+        A later pre-match business rejection must not relabel that already
+        committed cancellation as an unknown matching execution.
+        """
+        checkpoint = _financial_turn_checkpoint.get()
+        if (checkpoint is None or checkpoint[0] is not self or checkpoint[1] != symbol.upper()
+                or self.market_lock_owners.get(symbol.upper()) is not asyncio.current_task()):
+            raise RuntimeError("committed lifecycle requires the financial guard owner")
+        book = self.engine.books.get(symbol.upper())
+        checkpoint[2][0] = book.mutation_version if book is not None else 0
+
+    @asynccontextmanager
+    async def fast_matching_guard(self, symbol: str):
+        """Existing fast financial lock plus the shared stop-write contract.
+
+        No checkpoint or transaction layer: a failed post-match financial turn
+        is UNKNOWN and fenced until explicit authoritative recovery.
+        """
+        self.engine.fault.check()
+        async with self.clearinghouse.global_lock:
+            self.engine.fault.check()
+            book = self.engine.books.get(symbol)
+            version = book.mutation_version if book is not None else 0
+            try:
+                yield
+            except BaseException as exc:
+                from app.services.matching_faults import BusinessRejected
+                current = self.engine.books.get(symbol)
+                changed = (current.mutation_version if current is not None else 0) != version
+                if changed or not isinstance(exc, BusinessRejected):
+                    self.engine.fault.halt(f"fast financial execution unknown: {exc}")
+                raise
 
     async def orderbook_snapshot(
         self,
@@ -248,6 +301,11 @@ class AppRuntime:
         application bootstrap before request handling starts.
         """
         normalized = symbol.upper()
+        if self.engine.fault.halted:
+            previous = self.published_orderbooks.get(normalized)
+            if previous is not None:
+                return previous
+            self.engine.fault.check()
         publish_started = time.perf_counter()
         engine_version = self.engine.market_version(normalized)
         previous = self.published_orderbooks.get(normalized)
@@ -683,7 +741,7 @@ class AppRuntime:
                 "blocked": (writer.get("critical_sink") or {}).get("blocked"),
             }
             writer_healthy = writer_status not in {"HALTED", "DEGRADED", "STOPPED"}
-            if not writer_healthy:
+            if not writer_healthy and not self.engine.fault.halted:
                 metrics["status"] = writer_status
             metrics["watcher_restart_allowed"] = bool(
                 metrics.get("watcher_restart_allowed")

@@ -29,6 +29,8 @@ export function PaperAccountPage() {
   const accountMeta = useAppStore((state) => state.paperAccountMeta);
   const authSession = useAppStore((state) => state.authSession);
   const pushToast = useAppStore((state) => state.pushToast);
+  const [credentials, setCredentials] = useState<{api_key: string; api_secret: string}>();
+  const [keyError, setKeyError] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
   const [ledger, setLedger] = useState<{ spot: LedgerEntry[]; contract: LedgerEntry[] }>();
   const [error, setError] = useState("");
@@ -135,6 +137,21 @@ export function PaperAccountPage() {
             <InfoCard label="当前账户 epoch" value={String(accountMeta?.account_epoch ?? "-")} />
             <InfoCard label="当前 run" value={activeRun?.run_id ?? accountMeta?.account_run_id ?? "-"} mono small />
           </div>
+        </section>
+
+        <section className="panel rounded-2xl p-4">
+          <h2 className="text-base text-slate-100">个人交易 API</h2>
+          <p className="my-2 text-xs text-slate-400">已自动开通，仅操作自己的模拟账户。REST 请求通过 X-API-Key 请求头认证。</p>
+          <button className="rounded-xl bg-white/10 px-3 py-2 text-xs" onClick={() => {
+            if (credentials) { setCredentials(undefined); return; }
+            void api.get<{api_key:string; api_secret:string}>("/auth/api-key").then(setCredentials).catch(() => setKeyError("读取失败，请重新登录后重试"));
+          }}>{credentials ? "隐藏凭据" : "查看我的 API 凭据"}</button>
+          {keyError && <p className="text-rose-300">{keyError}</p>}
+          {credentials && <div className="mt-3 space-y-2 text-xs">
+            <label className="block">API Key<input className="paper-input font-mono" readOnly value={credentials.api_key} onFocus={e => e.target.select()} /></label>
+            <label className="block">API Secret（私有 WebSocket 签名）<input className="paper-input font-mono" readOnly value={credentials.api_secret} onFocus={e => e.target.select()} /></label>
+            <p className="text-slate-400">凭据等同于账户交易权限，请妥善保管。</p>
+          </div>}
         </section>
 
         <div className="grid gap-3 xl:grid-cols-2">

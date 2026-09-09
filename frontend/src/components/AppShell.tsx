@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router-dom";
 import { api } from "../api/client";
-import { config } from "../lib/config";
+import { config, appBasePath } from "../lib/config";
 import { useAppStore } from "../store/useAppStore";
 import type { SandboxHealth } from "../types";
 
@@ -17,6 +17,7 @@ type BrandResponse = {
 
 export function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation();
+  const isWideSurface = (location.pathname === "/ops/orderbook" || location.pathname.startsWith("/ops/orderbook/"));
   const isTradeSurface = /(^|\/)(trade|paper\/trade)\//.test(location.pathname);
   const authSession = useAppStore((state) => state.authSession);
   const setAuthSession = useAppStore((state) => state.setAuthSession);
@@ -36,7 +37,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     const refreshSandboxHealth = async () => {
       try {
         const apiOrigin = new URL(config.apiBaseUrl, window.location.origin).origin;
-        const response = await fetch(`${apiOrigin}/health`, { headers: { Accept: "application/json" } });
+        const response = await fetch(`${apiOrigin}${appBasePath}/health`, { headers: { Accept: "application/json" } });
         if (!response.ok) throw new Error(`health ${response.status}`);
         const payload = (await response.json()) as SandboxHealth;
         if (!disposed) setSandboxHealth(payload);
@@ -123,7 +124,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className={`app-shell min-h-screen px-3 py-3 text-slate-100 md:px-5 ${isTradeSurface ? "hl-shell" : ""}`}>
-      <div className={`app-shell-inner mx-auto max-w-[1680px] ${isTradeSurface ? "hl-shell-inner" : ""}`}>
+      <div className={`app-shell-inner mx-auto max-w-[1680px] ${isWideSurface ? "app-shell-wide" : ""} ${isTradeSurface ? "hl-shell-inner" : ""}`}>
         <header
           className={`app-shell-header sticky top-2 z-30 rounded-2xl border border-white/10 bg-slate-950/95 px-3 py-2.5 shadow-2xl backdrop-blur md:px-4 ${
             isTradeSurface ? "hl-app-header" : ""

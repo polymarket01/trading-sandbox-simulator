@@ -16,6 +16,10 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    instance_profile_path: str = ""
+    public_base_path: str = ""
+    public_origin: str = ""
+    external_bot_api_enabled: bool = False
     app_name: str = "Spot Market Sandbox"
     app_env: str = "development"
     api_prefix: str = "/api/v1"

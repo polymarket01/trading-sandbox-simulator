@@ -90,7 +90,7 @@ class ContractOrderCreateRequest(DecimalModel):
     tif: Literal["gtc", "ioc", "post_only"]
     quantity: Decimal
     price: Decimal | None = None
-    position_action: Literal["open", "close"]
+    position_action: Literal["open", "close"] = "open"
     reduce_only: bool = False
     # PaperTrading accepts a per-order leverage override.  Keeping it
     # optional preserves the existing account-setting fallback for bots and
@@ -106,7 +106,8 @@ class ContractOrderCreateRequest(DecimalModel):
             raise ValueError("post_only requires a limit order")
         if self.type == "market" and self.tif != "ioc":
             raise ValueError("market orders must be ioc")
-        if self.position_action == "close":
+        if self.position_action == "close" or self.reduce_only:
+            self.position_action = "close"
             self.reduce_only = True
         return self
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from app.services.matching_faults import NotExecuted
+from app.api.causal_helpers import matching_ack_response
+
 import math
 from datetime import UTC, datetime
 
@@ -364,11 +367,19 @@ async def create_order(
             else:
                 result = await service.place_order(session, user, payload)
         return await complete_causal_command(request, envelope, result, response=result)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except SyntheticFlowUnavailableError as exc:
         await session.rollback()
         await reject_causal_command(request, envelope, code="SYNTHETIC_FLOW_UNAVAILABLE", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="ORDER_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -416,8 +427,16 @@ async def replace_spot_quote_set(
             raise HTTPException(status_code=503, detail="fast order path unavailable")
         with causal_command_context(envelope):
             result = await service.submit_spot(session, user, payload)
-        return await complete_causal_command(request, envelope, result, response=result)
+        return matching_ack_response(await complete_causal_command(request, envelope, result, response=result))
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="QUOTE_SET_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -510,7 +529,15 @@ async def create_order_batch(
             }
             return await complete_causal_command(request, envelope, result, response=result)
         fast_result = await service.place_limit_gtc_order_batch(session, user, payload.orders)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="BATCH_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -615,7 +642,15 @@ async def cancel_order(
             raise HTTPException(status_code=503, detail="fast order path unavailable")
         result = await service.cancel_order(session, user, order_id)
         return await complete_causal_command(request, envelope, result, response=result)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="CANCEL_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -668,7 +703,15 @@ async def amend_order(
             raise HTTPException(status_code=503, detail="fast order path unavailable")
         result = await service.amend_order(session, user, order_id, payload)
         return await complete_causal_command(request, envelope, result, response=result)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="AMEND_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -715,7 +758,15 @@ async def amend_order_batch(
             raise HTTPException(status_code=503, detail="fast order path unavailable")
         result = await service.amend_order_batch(session, user, payload)
         return await complete_causal_command(request, envelope, result, response=result)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="AMEND_BATCH_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -758,7 +809,15 @@ async def cancel_all(
             raise HTTPException(status_code=503, detail="fast order path unavailable")
         result = await service.cancel_all(session, user, payload.symbol)
         return await complete_causal_command(request, envelope, result, response=result)
+    except NotExecuted as exc:
+        await session.rollback()
+        await reject_causal_command(request, envelope, code="MATCHING_NOT_EXECUTED", stage="MATCHING_ADMISSION", reason=str(exc))
+        raise HTTPException(status_code=503, detail={"status": "NOT_EXECUTED", "reason": str(exc)}) from exc
     except (OrderValidationError, ValueError) as exc:
+        if request.app.state.runtime.engine.fault.halted:
+            await session.rollback()
+            await mark_unknown_causal(request, envelope, reason=str(exc))
+            raise HTTPException(status_code=503, detail={"status": "UNKNOWN", "reason": str(exc)}) from exc
         await session.rollback()
         await reject_causal_command(request, envelope, code="CANCEL_ALL_REJECTED", stage="RISK", reason=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc

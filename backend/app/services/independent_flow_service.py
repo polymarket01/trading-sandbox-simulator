@@ -303,6 +303,9 @@ class IndependentFlowService:
                 item = runtime.market_data.ingest_display_trade(symbol, price=price, quantity=qty, side=side,
                     ts=datetime.now(UTC), trade_id='virtual-'+event_id, price_scale=market.price_precision,
                     qty_scale=market.qty_precision, source='virtual_volume')
+                tape = getattr(runtime, "public_trade_tape", None)
+                if tape is not None:
+                    await tape.append(symbol, item)
                 await broadcast_synthetic_flow(runtime, market, [item])
                 return {'status': 'virtual_print', 'price': str(price), 'quantity': str(qty), 'financial_effect': False, 'fair_price': str(fair), 'price_source': price_source}
             user = await self.flow_user(session, market, config.uid)

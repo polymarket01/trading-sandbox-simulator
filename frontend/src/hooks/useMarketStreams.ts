@@ -266,8 +266,8 @@ export function useMarketStreams(symbol: string, interval: string, depth: number
 
     const scheduleOrderbookCommit = () => {
       if (orderbookCommitTimer !== null) return;
-      // 将 50Hz+ 服务端快照合并到默认 20 FPS UI 更新，避免每帧重算100档深度。
-      orderbookCommitTimer = window.setTimeout(commitOrderbook, config.orderbookUiIntervalMs);
+      // Merge all pending wire updates into one visible browser frame. Hidden tabs do not repaint.
+      orderbookCommitTimer = window.requestAnimationFrame(commitOrderbook);
     };
 
     const queueSnapshot = (snapshot: PendingSnapshot) => {
@@ -422,7 +422,7 @@ export function useMarketStreams(symbol: string, interval: string, depth: number
     const handleVisibilityChange = () => {
       if (closedByEffect || document.visibilityState !== "visible") return;
       if (pendingSnapshot) {
-        if (orderbookCommitTimer !== null) window.clearTimeout(orderbookCommitTimer);
+        if (orderbookCommitTimer !== null) window.cancelAnimationFrame(orderbookCommitTimer);
         commitOrderbook();
       }
       if (wsOpen && Date.now() - lastOrderbookFrameAt > WATCHDOG_MS) restartSocket();
@@ -442,7 +442,7 @@ export function useMarketStreams(symbol: string, interval: string, depth: number
         window.clearTimeout(reconnectTimer);
       }
       if (orderbookCommitTimer !== null) {
-        window.clearTimeout(orderbookCommitTimer);
+        window.cancelAnimationFrame(orderbookCommitTimer);
       }
       fallbackAbortController?.abort();
       stopWatchdog();

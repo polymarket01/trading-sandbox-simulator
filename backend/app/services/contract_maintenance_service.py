@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, inspect, select
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import POSITION_SIDE_LONG, POSITION_SIDE_SHORT, PRODUCT_TYPE_PERP, ZERO
@@ -25,10 +27,49 @@ from app.services.contract_price_service import ContractPriceService
 from app.services.contract_service import ContractService
 from app.services.ids import next_funding_job_id
 from app.services.runtime import AppRuntime
+from app.services.sqlite_write_admission import WriteAdmissionRejected, acquire_sqlite_write_admission
 
 
 FUNDING_JOB_STALE_AFTER_SECONDS = 300
 FUNDING_JOB_MAX_RETRY_SECONDS = 900
+MAINTENANCE_WRITE_ATTEMPTS = 4
+MAINTENANCE_ADMISSION_SECONDS = 1.0
+MAINTENANCE_RETRY_SECONDS = 0.025
+
+
+async def _rollback_not_executed(session: AsyncSession) -> bool:
+    """Finish rejected preparation cleanup, even under repeated cancellation.
+
+    False means a disconnected session was invalidated and its ORM objects
+    were detached: preserve the rejection instead of retrying with those objects.
+    This task is created only after a rejection/cancellation, never on success.
+    """
+    async def cleanup():
+        try:
+            await session.rollback()
+            return True
+        except DBAPIError as exc:
+            if not exc.connection_invalidated:
+                raise
+            # A cancelled aiosqlite close may finish before SQLAlchemy clears
+            # its handle. The dialect has now confirmed the disconnect.
+            await session.invalidate()
+            return False
+
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.done():
+                result = task.result()
+                break
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
 
 
 class ContractMaintenanceService:
@@ -41,6 +82,119 @@ class ContractMaintenanceService:
         self.runtime = runtime
         self.contract_service = contract_service
         self.price_service = price_service
+
+    @staticmethod
+    def _maintenance_error(symbol: str, stage: str, exc: Exception) -> dict:
+        error = {"symbol": symbol, "stage": stage, "error": exc.__class__.__name__}
+        if isinstance(exc, WriteAdmissionRejected):
+            code = str(exc).partition(":")[0]
+            error["reason_code"] = code if code in {
+                "STORAGE_BUSY", "STORAGE_ADMISSION_TIMEOUT", "STORAGE_TRANSACTION_OPEN",
+            } else "WRITE_ADMISSION_REJECTED"
+        # Failure-only evidence: never format exception text, source lines,
+        # locals, SQL parameters, account keys or task names. Do not retain TBs.
+        directory = __file__.rsplit("/", 1)[0]
+        allowed = {f"{directory}/{name}": name for name in (
+            "runtime.py", "contract_maintenance_service.py", "sqlite_write_admission.py",
+        )}
+        pending, seen, chain, functions = [exc], set(), [], set()
+        frames_left, truncated = 32, False
+        while pending and len(chain) < 8:
+            current = pending.pop(0)
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            frames = []
+            traceback = current.__traceback__
+            while traceback is not None and frames_left:
+                frames_left -= 1
+                code = traceback.tb_frame.f_code
+                filename = allowed.get(code.co_filename)
+                if filename is not None:
+                    frames.append({"file": filename, "function": code.co_name[:100], "line": traceback.tb_lineno})
+                    functions.add((filename, code.co_name))
+                traceback = traceback.tb_next
+            truncated = truncated or traceback is not None
+            chain.append({"type": type(current).__name__[:100], "frames": frames})
+            for linked in (current.__cause__, current.__context__):
+                if linked is not None and id(linked) not in seen:
+                    pending.append(linked)
+        truncated = truncated or bool(pending)
+        financial_frames = {("contract_maintenance_service.py", "_financial_turn"),
+                            ("runtime.py", "market_financial_guard"), ("runtime.py", "financial_resources"),
+                            ("sqlite_write_admission.py", "acquire_sqlite_write_admission")}
+        if functions & financial_frames:
+            origin = "unknown"
+            if not truncated and error.get("reason_code") == "STORAGE_ADMISSION_TIMEOUT" and any(
+                    item["type"] == "TimeoutError" for item in chain):
+                if ("sqlite_write_admission.py", "acquire_sqlite_write_admission") in functions:
+                    origin = "sqlite_admission"
+                elif ("contract_maintenance_service.py", "_financial_turn") in functions:
+                    origin = "maintenance_preparation"
+            error["trace_diagnostic"] = {"origin": origin, "exceptions": chain, "truncated": truncated}
+        return error
+
+    @asynccontextmanager
+    async def _financial_turn(self, session: AsyncSession, market: Market, keys, *, has_work=None):
+        """Finish the SQL transaction before releasing its financial locks."""
+        market_symbol = market.symbol
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + MAINTENANCE_ADMISSION_SECONDS
+        for attempt in range(MAINTENANCE_WRITE_ATTEMPTS):
+            retry_error = None
+            yielded = False
+            async with AsyncExitStack() as locks:
+                try:
+                    # This deadline covers preparation only. Once yielded, a
+                    # financial operation and its commit must never be retried.
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            key_loader = keys
+                            if attempt:
+                                # rollback expired all ORM fields. Reload before
+                                # keys() uses them, inside the same market lock.
+                                async def key_loader():
+                                    await session.refresh(market)
+                                    return await keys()
+                            await locks.enter_async_context(self.runtime.market_financial_guard(market_symbol, key_loader))
+                            work = has_work is None or has_work()
+                    except TimeoutError as exc:
+                        raise WriteAdmissionRejected("STORAGE_ADMISSION_TIMEOUT: maintenance preparation timed out") from exc
+                    if loop.time() >= deadline:
+                        raise WriteAdmissionRejected("STORAGE_ADMISSION_TIMEOUT: maintenance preparation timed out")
+                    if work:
+                        try:
+                            # SQL admission owns the only active timer here.
+                            # Nested timers could cancel driver invalidation
+                            # twice, leaving a closed connection half detached.
+                            await acquire_sqlite_write_admission(
+                                session, timeout_ms=100,
+                                deadline_ms=max(1, int((deadline - loop.time()) * 1000)),
+                            )
+                        except WriteAdmissionRejected as exc:
+                            if not str(exc).startswith("STORAGE_BUSY:") or attempt + 1 == MAINTENANCE_WRITE_ATTEMPTS:
+                                raise
+                            retry_error = exc
+                    if retry_error is not None:
+                        raise retry_error
+                    if loop.time() >= deadline:
+                        raise WriteAdmissionRejected("STORAGE_ADMISSION_TIMEOUT: maintenance preparation timed out")
+                    yielded = True
+                    yield work
+                    await session.commit()
+                    return
+                except BaseException as exc:
+                    if yielded or not isinstance(exc, (WriteAdmissionRejected, asyncio.CancelledError)):
+                        await session.rollback()
+                        raise
+                    can_retry = await _rollback_not_executed(session)
+                    if exc is not retry_error or not can_retry:
+                        raise
+            # SQL ownership and every market/account lock are released before
+            # backoff, so foreground orders can progress between attempts.
+            if loop.time() + MAINTENANCE_RETRY_SECONDS >= deadline:
+                raise retry_error
+            await asyncio.sleep(MAINTENANCE_RETRY_SECONDS)
 
     @staticmethod
     def local_funding_boundary(market: Market, now: datetime) -> datetime:
@@ -346,17 +500,22 @@ class ContractMaintenanceService:
         return bool(existing)
 
     async def refresh_positions(self, session: AsyncSession, market: Market) -> list[dict]:
+        has_positions = False
         async def keys() -> list[str]:
+            nonlocal has_positions
             user_ids = (await session.execute(
                 select(ContractPosition.user_id).where(
                     ContractPosition.market_id == market.id,
                     ContractPosition.quantity > ZERO,
                 ).distinct()
             )).scalars().all()
+            has_positions = bool(user_ids)
             asset = (market.margin_asset or market.quote_asset).upper()
             return [f"contract:{int(user_id)}:{asset}" for user_id in sorted(user_ids)]
 
-        async with self.runtime.market_financial_guard(market.symbol, keys):
+        async with self._financial_turn(session, market, keys, has_work=lambda: has_positions) as work:
+            if not work:
+                return []
             rows = (await session.execute(
                 select(ContractPosition, ContractAccount, User)
                 .join(ContractAccount, ContractAccount.user_id == ContractPosition.user_id)
@@ -398,17 +557,24 @@ class ContractMaintenanceService:
             return alerts
 
     async def liquidate_due_positions(self, session: AsyncSession, market: Market, *, now: datetime) -> list[ContractLiquidationEvent]:
+        has_positions = False
         async def keys() -> list[str]:
+            nonlocal has_positions
             user_ids = (await session.execute(
                 select(ContractPosition.user_id).where(
                     ContractPosition.market_id == market.id,
                     ContractPosition.quantity > ZERO,
                 ).distinct()
             )).scalars().all()
+            has_positions = bool(user_ids)
+            if not has_positions:
+                return []
             asset = (market.margin_asset or market.quote_asset).upper()
             return [f"contract:{int(user_id)}:{asset}" for user_id in sorted(user_ids)] + [f"insurance:{asset}"]
 
-        async with self.runtime.market_financial_guard(market.symbol, keys):
+        async with self._financial_turn(session, market, keys, has_work=lambda: has_positions) as work:
+            if not work:
+                return []
             rows = await session.execute(
                 select(ContractPosition, ContractAccount)
                 .join(ContractAccount, ContractAccount.user_id == ContractPosition.user_id)
@@ -476,7 +642,20 @@ class ContractMaintenanceService:
         limit: int = 50,
         max_candidates: int = 20,
     ) -> tuple[list[dict], list[ContractAdlEvent], list[ContractLiquidationEvent]]:
+        has_pending_events = False
         async def keys() -> list[str]:
+            nonlocal has_pending_events
+            # Outstanding debt is work even when no counterparty position is
+            # currently available. Re-read the full events after write admission.
+            has_pending_events = await session.scalar(
+                select(ContractLiquidationEvent.id).where(
+                    ContractLiquidationEvent.market_id == market.id,
+                    ContractLiquidationEvent.adl_status.in_(["pending", "partial"]),
+                    ContractLiquidationEvent.adl_residual > ZERO,
+                ).limit(1)
+            ) is not None
+            if not has_pending_events:
+                return []
             user_ids = (await session.execute(
                 select(ContractPosition.user_id).where(
                     ContractPosition.market_id == market.id,
@@ -486,7 +665,9 @@ class ContractMaintenanceService:
             asset = (market.margin_asset or market.quote_asset).upper()
             return [f"contract:{int(user_id)}:{asset}" for user_id in sorted(user_ids)] + [f"insurance:{asset}"]
 
-        async with self.runtime.market_financial_guard(market.symbol, keys):
+        async with self._financial_turn(session, market, keys, has_work=lambda: has_pending_events) as work:
+            if not work:
+                return [], [], []
             return await self._process_pending_adl_locked(
                 session,
                 market,
@@ -610,6 +791,9 @@ class ContractMaintenanceService:
         auto_adl: bool = True,
     ) -> dict:
         now = now or datetime.now(tz=UTC)
+        # This orchestrator owns its commits. Never carry an earlier write
+        # transaction into market-lock acquisition or an external price fetch.
+        await session.commit()
         rows = await session.execute(
             select(Market).where(Market.product_type == PRODUCT_TYPE_PERP, Market.is_active.is_(True)).order_by(Market.symbol.asc())
         )
@@ -629,19 +813,43 @@ class ContractMaintenanceService:
             "adl_events": [],
             "adl_event_count": 0,
             "risk_alert_count": 0,
+            "stale_risk_markets": [],
             "errors": [],
         }
         risk_alerts: dict[str, list[dict]] = {}
-        for market in rows.scalars():
-            market_symbol = market.symbol
-            market_id = market.id
+        markets = list(rows.scalars())
+        market_refs = [(market.id, market.symbol) for market in markets]
+        for market_id, market_symbol in market_refs:
             metrics["markets"] += 1
+            stage = "load_market"
             try:
-                state = await self.price_service.refresh_market_state(session, market, fetch_external=fetch_external)
+                market = await session.get(Market, market_id)
+                if market is None:
+                    continue
+                prior_snapshot = self.runtime.contract_price_snapshots.get(market_symbol)
+                prior_persist_ms = self.runtime.contract_price_persist_ms.get(market_symbol)
+                stage = "price_refresh"
+                try:
+                    state = await self.price_service.refresh_market_state(session, market, fetch_external=fetch_external)
+                    # Price collection is independent from the financial turn.
+                    # Release its write lock before acquiring any market lock.
+                    await session.commit()
+                except BaseException:
+                    if prior_snapshot is None:
+                        self.runtime.contract_price_snapshots.pop(market_symbol, None)
+                    else:
+                        self.runtime.contract_price_snapshots[market_symbol] = prior_snapshot
+                    if prior_persist_ms is None:
+                        self.runtime.contract_price_persist_ms.pop(market_symbol, None)
+                    else:
+                        self.runtime.contract_price_persist_ms[market_symbol] = prior_persist_ms
+                    raise
                 metrics["price_refreshes"] += 1
+                stage = "mark_to_market"
                 alerts = await self.refresh_positions(session, market)
                 liquidation_events: list[ContractLiquidationEvent] = []
                 if auto_liquidate:
+                    stage = "liquidation"
                     liquidation_events = await self.liquidate_due_positions(session, market, now=now)
                     if liquidation_events:
                         # Financial facts are final only after commit. WebSocket
@@ -652,9 +860,12 @@ class ContractMaintenanceService:
                             await self.broadcast_liquidations(session, market, liquidation_events)
                         except Exception as exc:
                             await session.rollback()
+                            await session.refresh(market)
+                            state = await self.price_service.get_state(session, market)
                             metrics["errors"].append(
-                                {"symbol": market_symbol, "stage": "liquidation_broadcast", "error": exc.__class__.__name__}
+                                self._maintenance_error(market_symbol, "liquidation_broadcast", exc)
                             )
+                        stage = "mark_to_market"
                         alerts = await self.refresh_positions(session, market)
                         metrics["liquidation_count"] += len(liquidation_events)
                         metrics["liquidations"].extend(
@@ -673,6 +884,7 @@ class ContractMaintenanceService:
                             ]
                         )
                 if auto_liquidate and auto_adl:
+                    stage = "adl"
                     adl_items, adl_events, adl_liquidation_events = await self.process_pending_adl(
                         session, market, now=now
                     )
@@ -688,15 +900,22 @@ class ContractMaintenanceService:
                             )
                         except Exception as exc:
                             await session.rollback()
+                            await session.refresh(market)
+                            state = await self.price_service.get_state(session, market)
                             metrics["errors"].append(
-                                {"symbol": market_symbol, "stage": "adl_broadcast", "error": exc.__class__.__name__}
+                                self._maintenance_error(market_symbol, "adl_broadcast", exc)
                             )
+                        stage = "mark_to_market"
                         alerts = await self.refresh_positions(session, market)
                         metrics["adl_events"].extend(adl_items)
                         metrics["adl_event_count"] += sum(int(item.get("event_count") or 0) for item in adl_items)
                 risk_alerts[market.symbol] = alerts
-                metrics["risk_alert_count"] += len(alerts)
 
+                stage = "funding"
+                # A successful pre-write retry rolled back and expired the
+                # price state retained from the earlier committed refresh.
+                if inspect(state).expired:
+                    await session.refresh(state)
                 funding_time = self.due_funding_time(state, market, now)
                 if auto_settle_funding and funding_time <= now and not await self.funding_already_settled(session, market, funding_time):
                     job = await self.ensure_funding_job(session, market, funding_time, now=now)
@@ -732,10 +951,22 @@ class ContractMaintenanceService:
                             await session.commit()
                             metrics["funding_job_failures"] += 1
                             metrics["funding_jobs"].append(self.serialize_funding_job(job, reloaded_market, action="failed"))
-                            metrics["errors"].append({"symbol": market_symbol, "stage": "funding", "error": exc.__class__.__name__})
+                            metrics["errors"].append(self._maintenance_error(market_symbol, "funding", exc))
+                # A completed/rejected funding job is a separate metadata
+                # transaction. Do not carry it into the next market's HTTP call.
+                stage = "commit"
+                await session.commit()
             except Exception as exc:
                 await session.rollback()
-                metrics["errors"].append({"symbol": market_symbol, "error": exc.__class__.__name__})
+                metrics["errors"].append(self._maintenance_error(market_symbol, stage, exc))
+        # A failed turn cannot certify that its prior risk alerts disappeared.
+        # Only active markets from this run can retain stale alerts; a later
+        # successful turn replaces them, including with an empty list.
+        failed_markets = {error["symbol"] for error in metrics["errors"]}
+        metrics["stale_risk_markets"] = sorted(failed_markets)
+        for symbol in failed_markets:
+            risk_alerts[symbol] = list(self.runtime.contract_risk_alerts.get(symbol, []))
+        metrics["risk_alert_count"] = sum(len(alerts) for alerts in risk_alerts.values())
         self.runtime.contract_risk_alerts = risk_alerts
         self.runtime.contract_maintenance_metrics = metrics
         await session.commit()

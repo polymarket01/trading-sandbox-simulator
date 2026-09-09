@@ -5,7 +5,10 @@ from datetime import datetime
 from decimal import Decimal
 import logging
 from time import monotonic
+from weakref import WeakSet
 from typing import Callable
+
+from app.services.matching_faults import MatchingFault, BusinessRejected, BookInvariantError
 
 from sortedcontainers import SortedDict
 
@@ -110,6 +113,7 @@ class BulkQuotePatchResult:
     rejected_count: int = 0
     operation_counts: dict[str, int] = field(default_factory=dict)
     fills: list[MatchFill] = field(default_factory=list)
+    fill_takers: list[tuple[str, int, str]] = field(default_factory=list)
     changed_bids: list[list[str]] = field(default_factory=list)
     changed_asks: list[list[str]] = field(default_factory=list)
     sequence_number: int = 0
@@ -117,7 +121,7 @@ class BulkQuotePatchResult:
     stp_decremented_quantity: Decimal = Decimal("0")
 
 
-class BulkQuotePatchError(ValueError):
+class BulkQuotePatchError(BusinessRejected, ValueError):
     """Raised after a failed patch has been rolled back completely."""
 
     def __init__(self, message: str, *, operation_index: int) -> None:
@@ -185,7 +189,8 @@ class PriceLevel:
 
 
 class MarketBook:
-    def __init__(self) -> None:
+    def __init__(self, fault: MatchingFault | None = None) -> None:
+        self.fault = fault or MatchingFault()
         self.bids = SortedDict()
         self.asks = SortedDict()
         self.orders: dict[str, BookNode] = {}
@@ -340,6 +345,10 @@ class MarketBook:
                     result.stop_reason = f"stp_{decision.mode}"
                     if decision.mode in {"cancel_taker", "reject"}:
                         return result
+                    if decision.mode == "decrement_and_cancel":
+                        decrement = min(result.remaining_quantity, maker_node.remaining)
+                        result.remaining_quantity -= decrement
+                        result.stp_decremented_quantity += decrement
                     maker_node = maker_node.next
                     continue
                 if maker_guard is not None and not maker_guard(
@@ -366,6 +375,8 @@ class MarketBook:
         return result
 
     def add_resting_order(self, order: BookOrder) -> list[list[str]]:
+        if self.fault.halted:
+            self.fault.check()
         node = BookNode(
             order_id=order.order_id,
             user_id=order.user_id,
@@ -382,6 +393,8 @@ class MarketBook:
         return self._attach_node(node)
 
     def cancel_order(self, order_id: str) -> tuple[str | None, Decimal | None, list[list[str]]]:
+        if self.fault.halted:
+            self.fault.check()
         node = self.orders.get(order_id)
         if node is None:
             return None, None, []
@@ -391,6 +404,8 @@ class MarketBook:
         return side, remaining, changes
 
     def reconcile_open_orders(self, valid_order_ids: set[str]) -> tuple[list[list[str]], list[list[str]], list[str]]:
+        if self.fault.halted:
+            self.fault.check()
         changed_bids: list[list[str]] = []
         changed_asks: list[list[str]] = []
         removed: list[str] = []
@@ -417,6 +432,8 @@ class MarketBook:
         *,
         sequence_number: int | None = None,
     ) -> AmendResult | None:
+        if self.fault.halted:
+            self.fault.check()
         node = self.orders.get(order_id)
         if node is None:
             return None
@@ -470,6 +487,8 @@ class MarketBook:
         )
 
     def batch_amend_orders(self, requests: list[AmendOrderRequest]) -> BatchAmendResult:
+        if self.fault.halted:
+            self.fault.check()
         batch = BatchAmendResult()
         missing_order_ids = [request.order_id for request in requests if request.order_id not in self.orders]
         if missing_order_ids:
@@ -509,6 +528,8 @@ class MarketBook:
         stp_mode: str = "cancel_taker",
         stp_policy: SelfTradePolicy | None = None,
     ) -> EngineResult:
+        if self.fault.halted:
+            self.fault.check()
         result = EngineResult(remaining_quantity=quantity)
         policy = stp_policy or SelfTradePolicy(same_account_mode=stp_mode)
         stp_blocked = False
@@ -626,6 +647,15 @@ class MarketBook:
             result.placed_on_book = True
         return result
 
+    def iter_fifo_nodes(self):
+        """Cold-path traversal in actual side/price/head-to-next order."""
+        for side in (SIDE_BUY, SIDE_SELL):
+            for _price, level in self._iter_levels(side):
+                node = level.head
+                while node is not None:
+                    yield node
+                    node = node.next
+
     def _checkpoint(self) -> tuple[list[BookOrder], int]:
         return (
             [
@@ -642,7 +672,7 @@ class MarketBook:
                     stp_is_bot=node.stp_is_bot,
                     stp_mode=node.stp_mode,
                 )
-                for node in self.orders.values()
+                for node in self.iter_fifo_nodes()
             ],
             self.mutation_version,
         )
@@ -672,43 +702,33 @@ class MarketBook:
         self.mutation_version = version
 
     def validate_invariants(self) -> None:
-        indexed: set[str] = set()
-        for side, levels in ((SIDE_BUY, self.bids), (SIDE_SELL, self.asks)):
-            for price, level in levels.items():
-                if level.price != price or level.is_empty():
-                    raise ValueError("empty or mismatched price level")
-                total = Decimal("0")
-                previous = None
-                node = level.head
-                while node is not None:
-                    if node.side != side or node.level is not level or node.prev is not previous:
-                        raise ValueError("broken price-time links")
-                    if node.order_id in indexed or node.remaining <= 0:
-                        raise ValueError("duplicate or non-positive resting order")
-                    indexed.add(node.order_id)
-                    total += node.remaining
-                    previous = node
-                    node = node.next
-                if previous is not level.tail or total != level.total_remaining:
-                    raise ValueError("price level quantity invariant failed")
-        if indexed != set(self.orders):
-            raise ValueError("order index invariant failed")
+        try:
+            indexed: set[str] = set()
+            for side, levels in ((SIDE_BUY, self.bids), (SIDE_SELL, self.asks)):
+                for price, level in levels.items():
+                    if level.price != price or level.is_empty():
+                        raise BookInvariantError("empty or mismatched price level")
+                    total = Decimal("0")
+                    previous = None
+                    node = level.head
+                    while node is not None:
+                        if node.side != side or node.price != price or node.level is not level or node.prev is not previous:
+                            raise BookInvariantError("broken price-time links")
+                        if node.order_id in indexed or node.remaining <= 0 or self.orders.get(node.order_id) is not node:
+                            raise BookInvariantError("duplicate or non-positive resting order")
+                        indexed.add(node.order_id)
+                        total += node.remaining
+                        previous = node
+                        node = node.next
+                    if previous is not level.tail or total != level.total_remaining:
+                        raise BookInvariantError("price level quantity invariant failed")
+            if indexed != set(self.orders):
+                raise BookInvariantError("order index invariant failed")
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT")
+            raise
 
-    def bulk_quote_patch(
-        self,
-        operations: list[BulkQuotePatchOperation],
-        *,
-        sequence_number: int = 0,
-    ) -> BulkQuotePatchResult:
-        """Apply one quote patch transaction inside this market's single writer.
-
-        The caller's sequencer is the market writer/lock.  This method does no
-        I/O, takes no per-operation lock, and runs exactly one invariant check
-        after the ordered cancel -> release/shrink -> amend -> place phases.
-        Any exception rebuilds the linked lists from a private checkpoint.
-        """
-        checkpoint = self._checkpoint()
-        result = BulkQuotePatchResult(sequence_number=int(sequence_number))
+    def ordered_patch_operations(self, operations):
         indexed_operations = list(enumerate(operations))
 
         def priority(item: tuple[int, BulkQuotePatchOperation]) -> tuple[int, int]:
@@ -726,8 +746,36 @@ class MarketBook:
             return 4, index
 
         indexed_operations.sort(key=priority)
+        return indexed_operations
+
+    def bulk_quote_patch(
+        self,
+        operations: list[BulkQuotePatchOperation],
+        *,
+        sequence_number: int = 0,
+        next_priority: Callable[[], int] | None = None,
+    ) -> BulkQuotePatchResult:
+        """Apply one quote patch transaction inside this market's single writer.
+
+        The caller's sequencer is the market writer/lock.  This method does no
+        I/O, takes no per-operation lock, and runs exactly one invariant check
+        after the ordered cancel -> release/shrink -> amend -> place phases.
+        Any exception rebuilds the linked lists from a private checkpoint.
+        """
+        if self.fault.halted:
+            self.fault.check()
+        result = BulkQuotePatchResult(sequence_number=int(sequence_number))
+        if not operations:
+            # No mutation means no rollback image is needed. Retain the same
+            # invariant responsibility even on an empty diagnostic patch.
+            self.validate_invariants()
+            return result
+        checkpoint = self._checkpoint()
+        indexed_operations = self.ordered_patch_operations(operations)
         try:
             for original_index, operation in indexed_operations:
+                if next_priority is not None:
+                    operation.sequence_number = next_priority()
                 action = str(operation.action)
                 if action == "cancel":
                     side, _remaining, changes = self.cancel_order(operation.order_id)
@@ -744,19 +792,37 @@ class MarketBook:
                             f"amend requires price and quantity: {operation.order_id}",
                             operation_index=original_index,
                         )
-                    amend = self.amend_order(
-                        operation.order_id,
-                        operation.price,
-                        operation.quantity,
-                        sequence_number=operation.sequence_number or None,
-                    )
-                    if amend is None:
-                        raise BulkQuotePatchError(
-                            f"order not found for amend: {operation.order_id}",
-                            operation_index=original_index,
+                    node = self.orders.get(operation.order_id)
+                    if node is None:
+                        raise BulkQuotePatchError(f"order not found for amend: {operation.order_id}", operation_index=original_index)
+                    if not operation.price.is_finite() or not operation.quantity.is_finite() or operation.price <= 0 or operation.quantity <= 0:
+                        raise BulkQuotePatchError("amend requires positive finite price and quantity", operation_index=original_index)
+                    best = self.best_ask() if node.side == SIDE_BUY else self.best_bid()
+                    crossing = best is not None and (operation.price >= best if node.side == SIDE_BUY else operation.price <= best)
+                    if crossing:
+                        side, _, changes = self.cancel_order(node.order_id)
+                        target = result.changed_bids if side == SIDE_BUY else result.changed_asks
+                        target.extend(changes)
+                        matched = self.process_order(
+                            order_id=node.order_id, user_id=node.user_id, side=node.side,
+                            quantity=operation.quantity, created_at=node.created_at,
+                            limit_price=operation.price, can_rest=operation.can_rest,
+                            sequence_number=operation.sequence_number,
+                            maker_guard=operation.maker_guard,
+                            stp_account_key=node.stp_account_key, stp_group_key=node.stp_group_key,
+                            stp_is_bot=node.stp_is_bot, stp_mode=node.stp_mode, stp_policy=operation.stp_policy,
                         )
-                    result.changed_bids.extend(amend.changed_bids)
-                    result.changed_asks.extend(amend.changed_asks)
+                        result.fills.extend(matched.fills)
+                        result.fill_takers.extend([(node.order_id, node.user_id, node.side)] * len(matched.fills))
+                        result.changed_bids.extend(matched.changed_bids)
+                        result.changed_asks.extend(matched.changed_asks)
+                        result.stp_intercept_count += matched.stp_intercept_count
+                        result.stp_decremented_quantity += matched.stp_decremented_quantity
+                    else:
+                        amend = self.amend_order(node.order_id, operation.price, operation.quantity,
+                                                 sequence_number=operation.sequence_number or None)
+                        result.changed_bids.extend(amend.changed_bids)
+                        result.changed_asks.extend(amend.changed_asks)
                 elif action == "place":
                     if operation.side not in {SIDE_BUY, SIDE_SELL}:
                         raise BulkQuotePatchError("place requires a valid side", operation_index=original_index)
@@ -787,6 +853,7 @@ class MarketBook:
                         stp_policy=operation.stp_policy,
                     )
                     result.fills.extend(placed.fills)
+                    result.fill_takers.extend([(operation.order_id, operation.user_id, str(operation.side))] * len(placed.fills))
                     result.changed_bids.extend(placed.changed_bids)
                     result.changed_asks.extend(placed.changed_asks)
                     result.stp_intercept_count += placed.stp_intercept_count
@@ -806,12 +873,14 @@ class MarketBook:
 
 class MatchingEngine:
     def __init__(self) -> None:
+        self.fault = MatchingFault()
         self.books: dict[str, MarketBook] = {}
+        self.sequencers = WeakSet()
 
     def ensure_market(self, symbol: str) -> MarketBook:
         book = self.books.get(symbol)
         if book is None:
-            book = MarketBook()
+            book = MarketBook(self.fault)
             self.books[symbol] = book
         return book
 
@@ -876,27 +945,39 @@ class MatchingEngine:
         stp_mode: str = "cancel_taker",
         stp_policy: SelfTradePolicy | None = None,
     ) -> EngineResult:
-        return self.ensure_market(symbol).process_order(
-            order_id=order_id,
-            user_id=user_id,
-            side=side,
-            quantity=quantity,
-            created_at=created_at,
-            limit_price=limit_price,
-            can_rest=can_rest,
-            max_price=max_price,
-            min_price=min_price,
-            sequence_number=sequence_number,
-            maker_guard=maker_guard,
-            stp_account_key=stp_account_key,
-            stp_group_key=stp_group_key,
-            stp_is_bot=stp_is_bot,
-            stp_mode=stp_mode,
-            stp_policy=stp_policy,
-        )
+        try:
+            return self.ensure_market(symbol).process_order(
+                order_id=order_id,
+                user_id=user_id,
+                side=side,
+                quantity=quantity,
+                created_at=created_at,
+                limit_price=limit_price,
+                can_rest=can_rest,
+                max_price=max_price,
+                min_price=min_price,
+                sequence_number=sequence_number,
+                maker_guard=maker_guard,
+                stp_account_key=stp_account_key,
+                stp_group_key=stp_group_key,
+                stp_is_bot=stp_is_bot,
+                stp_mode=stp_mode,
+                stp_policy=stp_policy,
+            )
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def cancel_order(self, symbol: str, order_id: str) -> tuple[str | None, Decimal | None, list[list[str]]]:
-        return self.ensure_market(symbol).cancel_order(order_id)
+        try:
+            return self.ensure_market(symbol).cancel_order(order_id)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def amend_order(
         self,
@@ -907,30 +988,42 @@ class MatchingEngine:
         *,
         sequence_number: int | None = None,
     ) -> AmendResult | None:
-        amend = self.ensure_market(symbol).amend_order(
-            order_id,
-            new_price,
-            new_remaining,
-            sequence_number=sequence_number,
-        )
-        if amend is None:
-            # 镜像/引擎分叉时策略 QuoteSet 会以每秒数十次的速度重试同一批
-            # amend，逐条 WARNING 会把日志刷到数百 MB。按市场限速告警，
-            # 分叉本身由机器人报价幽灵驱逐自愈。
-            now = monotonic()
-            if now - _amend_miss_last_log.get(symbol, 0.0) >= 1.0:
-                _amend_miss_last_log[symbol] = now
-                _engine_logger.warning(
-                    "engine amend_order returned None symbol=%s order_id=%s new_price=%s new_remaining=%s",
-                    symbol,
-                    order_id,
-                    new_price,
-                    new_remaining,
-                )
-        return amend
+        try:
+            amend = self.ensure_market(symbol).amend_order(
+                order_id,
+                new_price,
+                new_remaining,
+                sequence_number=sequence_number,
+            )
+            if amend is None:
+                # 镜像/引擎分叉时策略 QuoteSet 会以每秒数十次的速度重试同一批
+                # amend，逐条 WARNING 会把日志刷到数百 MB。按市场限速告警，
+                # 分叉本身由机器人报价幽灵驱逐自愈。
+                now = monotonic()
+                if now - _amend_miss_last_log.get(symbol, 0.0) >= 1.0:
+                    _amend_miss_last_log[symbol] = now
+                    _engine_logger.warning(
+                        "engine amend_order returned None symbol=%s order_id=%s new_price=%s new_remaining=%s",
+                        symbol,
+                        order_id,
+                        new_price,
+                        new_remaining,
+                    )
+            return amend
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def batch_amend_orders(self, symbol: str, requests: list[AmendOrderRequest]) -> BatchAmendResult:
-        return self.ensure_market(symbol).batch_amend_orders(requests)
+        try:
+            return self.ensure_market(symbol).batch_amend_orders(requests)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def bulk_quote_patch(
         self,
@@ -938,14 +1031,74 @@ class MatchingEngine:
         operations: list[BulkQuotePatchOperation],
         *,
         sequence_number: int = 0,
+        next_priority: Callable[[], int] | None = None,
     ) -> BulkQuotePatchResult:
-        return self.ensure_market(symbol).bulk_quote_patch(operations, sequence_number=sequence_number)
+        try:
+            return self.ensure_market(symbol).bulk_quote_patch(operations, sequence_number=sequence_number, next_priority=next_priority)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def load_resting_order(self, symbol: str, order: BookOrder) -> None:
-        self.ensure_market(symbol).add_resting_order(order)
+        try:
+            self.ensure_market(symbol).add_resting_order(order)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
 
     def reconcile_open_orders(self, symbol: str, valid_order_ids: set[str]) -> tuple[list[list[str]], list[list[str]], list[str]]:
-        return self.ensure_market(symbol).reconcile_open_orders(valid_order_ids)
+        try:
+            return self.ensure_market(symbol).reconcile_open_orders(valid_order_ids)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
+
+    def rebuild_market(self, symbol: str, orders: list[BookOrder]) -> dict:
+        self.fault.check()
+        ordered, report = recovery_priority_order(orders)
+        candidate = MarketBook()
+        for order in ordered:
+            if order.order_id in candidate.orders:
+                raise ValueError("duplicate authoritative recovery order")
+            candidate.add_resting_order(order)
+        candidate.validate_invariants()
+        candidate.fault = self.fault
+        self.books[symbol] = candidate
+        if not report["fifo_exact"]:
+            _engine_logger.warning("recovery FIFO compatibility symbol=%s ambiguous_levels=%s", symbol, report["ambiguous_levels"])
+        return report
 
     def clear_market(self, symbol: str) -> None:
+        self.fault.check()
         self.books.pop(symbol, None)
+
+
+def recovery_priority_order(orders: list[BookOrder]) -> tuple[list[BookOrder], dict]:
+    """Cold merge of authoritative records, after source-specific deduplication.
+
+    sequence_number is the market priority clock (shrink keeps it, requeue
+    replaces it). Missing/tied priorities cannot prove historical FIFO: stable
+    source order is a compatibility fallback, never invented timestamps.
+    """
+    seen = set()
+    ambiguous = set()
+    for order in orders:
+        level = (order.side, order.price)
+        priority = order.sequence_number
+        key = (*level, priority)
+        if type(priority) is not int or priority <= 0 or key in seen:
+            ambiguous.add(level)
+        seen.add(key)
+    def key(order):
+        value = order.sequence_number
+        return (0, value) if type(value) is int and value > 0 else (1, 0)
+    ordered = sorted(orders, key=key)
+    report = {"fifo_exact": not ambiguous, "ambiguous_levels": len(ambiguous),
+              "fallback": None if not ambiguous else "known_priority_then_stable_source_order"}
+    return ordered, report

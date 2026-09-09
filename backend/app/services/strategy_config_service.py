@@ -233,6 +233,10 @@ async def selected_market_strategy_config(
             return MarketStrategyConfig(market_id=market.id, strategy_key="NONE", config_json={}, is_enabled=False)
         repair_legacy_strategy_config(selected)
         return selected
+    from app.core.config import settings
+    if settings.instance_profile_path:
+        # Explicit profiles never manufacture a strategy for an unconfigured market.
+        return MarketStrategyConfig(market_id=market.id, strategy_key="NONE", config_json={}, is_enabled=False)
     if not choices:
         return MarketStrategyConfig(market_id=market.id, strategy_key="NONE", config_json={}, is_enabled=False)
     preferred = "PERP_MM" if market.product_type == "PERP" else "LITE"

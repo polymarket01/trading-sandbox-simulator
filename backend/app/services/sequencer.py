@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Callable
 
 from app.core.constants import SIDE_BUY, SIDE_SELL
+from app.services.matching_faults import BusinessRejected, NotExecuted, BookInvariantError
 from app.services.execution_events import EventOutbox, ExecutionEvent, decimal_payload
 from app.services.matching_engine import (
     AmendOrderRequest,
@@ -143,6 +144,8 @@ class SymbolSequencer:
     ) -> None:
         self.symbol = symbol.upper()
         self.engine = engine
+        self.fault = engine.fault
+        engine.sequencers.add(self)
         self.outbox = outbox
         self.next_sequence = next_sequence
         self.observe_sequence = observe_sequence
@@ -150,6 +153,7 @@ class SymbolSequencer:
         self._worker_task: asyncio.Task | None = None
         self._stopping = False
         self._inline_depth = 0
+        self._inline_owner = None
 
     def start(self) -> None:
         if self._worker_task is None or self._worker_task.done():
@@ -162,9 +166,16 @@ class SymbolSequencer:
             self._worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
+        self._worker_task = None
+        while not self._queue.empty():
+            queued = self._queue.get_nowait()
+            if not queued.future.done():
+                queued.future.set_exception(NotExecuted("sequencer stopped before execution"))
+            self._queue.task_done()
 
     async def submit(self, command: SequencerCommand) -> SequencerResult:
-        if self._inline_depth > 0:
+        self.fault.check()
+        if self._inline_depth > 0 and self._inline_owner is asyncio.current_task():
             # ExchangeCore's market worker already owns the execution turn.
             # Inline execution prevents a second queue/future timeline for a
             # QuoteSet while preserving the legacy queue for direct callers.
@@ -175,23 +186,33 @@ class SymbolSequencer:
         try:
             self._queue.put_nowait(_QueuedCommand(command=command, future=future))
         except asyncio.QueueFull as exc:
-            raise RuntimeError(f"symbol sequencer queue is full: {self.symbol}") from exc
-        return await future
+            raise NotExecuted(f"symbol sequencer queue is full: {self.symbol}") from exc
+        # Retrieve errors even when all request waiters have disconnected.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return await asyncio.shield(future)
 
     @contextlib.contextmanager
     def inline_execution(self):
+        owner = asyncio.current_task()
+        if self._inline_owner is not None and self._inline_owner is not owner:
+            raise NotExecuted("another task owns this symbol inline context")
+        self._inline_owner = owner
         self._inline_depth += 1
         try:
             yield
         finally:
-            self._inline_depth = max(0, self._inline_depth - 1)
+            self._inline_depth -= 1
+            if self._inline_depth == 0:
+                self._inline_owner = None
 
     async def _run(self) -> None:
         while not self._stopping:
             queued = await self._queue.get()
             try:
                 result = self._execute(queued.command)
-            except Exception as exc:  # pragma: no cover - defensive worker guard
+            except Exception as exc:
+                if not isinstance(exc, BusinessRejected):
+                    self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
                 if not queued.future.done():
                     queued.future.set_exception(exc)
             else:
@@ -201,6 +222,16 @@ class SymbolSequencer:
                 self._queue.task_done()
 
     def _execute(self, command: SequencerCommand) -> SequencerResult:
+        self.fault.check()
+        try:
+            return self._dispatch(command)
+        except BusinessRejected:
+            raise
+        except Exception as exc:
+            self.fault.halt(exc, category="INVARIANT" if isinstance(exc, BookInvariantError) else "UNKNOWN")
+            raise
+
+    def _dispatch(self, command: SequencerCommand) -> SequencerResult:
         if isinstance(command, NewOrderCommand):
             return self._execute_new(command)
         if isinstance(command, CancelOrderCommand):
@@ -453,16 +484,16 @@ class SymbolSequencer:
 
     def _execute_bulk_quote_patch(self, command: BulkQuotePatchCommand) -> SequencerResult:
         batch_sequence = self.next_sequence(self.symbol)
+        # The book normalizes cancel/shrink/amend/place phases. Allocate
+        # priority at actual execution, never before that reorder.
         for operation in command.operations:
-            if operation.sequence_number:
-                if self.observe_sequence is not None:
-                    self.observe_sequence(self.symbol, operation.sequence_number)
-            else:
-                operation.sequence_number = self.next_sequence(self.symbol)
+            if operation.sequence_number and self.observe_sequence is not None:
+                self.observe_sequence(self.symbol, operation.sequence_number)
         result = self.engine.bulk_quote_patch(
             self.symbol,
             command.operations,
             sequence_number=batch_sequence,
+            next_priority=lambda: self.next_sequence(self.symbol),
         )
         self.outbox.publish_nowait(
             ExecutionEvent(

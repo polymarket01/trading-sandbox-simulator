@@ -70,7 +70,19 @@ class CausalCommandService:
         with the same fingerprint receives the stored receipt; a different
         fingerprint is an explicit conflict.
         """
+        for attempt in range(_attempt, 8):
+            try:
+                return await self._begin_once(envelope)
+            except Exception as exc:
+                if "database is locked" not in str(exc).lower() or attempt >= 7:
+                    raise
+                # _begin_once has released both its session and _db_lock.
+                # Recursively calling begin while holding that lock deadlocked
+                # the entire public command journal after the first busy error.
+                await asyncio.sleep(min(2.0, 0.05 * (2**attempt)))
+        raise RuntimeError("causal command journal retry exhausted before execution")
 
+    async def _begin_once(self, envelope: CommandEnvelope) -> tuple[CommandReceipt, bool]:
         now = datetime.now(tz=UTC)
         async with self._db_lock, self._session_factory() as session:
             existing = await session.get(CausalCommandJournal, envelope.command_id)
@@ -118,12 +130,6 @@ class CausalCommandService:
                 if existing.request_fingerprint != envelope.request_fingerprint:
                     return self._receipt_from_row(existing, status="IDEMPOTENCY_CONFLICT"), False
                 return self._receipt_from_row(existing), False
-            except Exception as exc:
-                await session.rollback()
-                if "database is locked" in str(exc).lower() and _attempt < 7:
-                    await asyncio.sleep(min(2.0, 0.05 * (2**_attempt)))
-                    return await self.begin(envelope, _attempt=_attempt + 1)
-                raise
         return self._receipt_from_row(row), True
 
     async def complete(self, envelope: CommandEnvelope, result: dict, **kwargs) -> CommandReceipt:
@@ -181,36 +187,28 @@ class CausalCommandService:
                     CausalExecutionBundleRecord.command_id == envelope.command_id
                 )
             )
-            if existing_execution is None:
-                session.add(
-                    CausalExecutionBundleRecord(
-                        execution_id=execution_id,
-                        command_id=envelope.command_id,
-                        epoch=envelope.epoch,
-                        execution_sequence=execution_sequence,
-                        priority_sequence=int(priority_sequence),
-                        book_sequence=int(book_sequence),
-                        event_sequence=execution_sequence,
-                        accepted=bundle.accepted,
-                        rejected=bundle.rejected,
-                        result_hash=bundle.result_hash,
-                        bundle_json=canonical_json(bundle.as_dict()),
-                        state=normalized_status,
-                        created_at=now,
-                        durable_at=now,
-                    )
-                )
-                row.execution_id = execution_id
-                row.result_hash = bundle.result_hash
-            else:
-                execution_id = str(existing_execution.execution_id)
-                execution_sequence = int(existing_execution.execution_sequence)
-                bundle = ExecutionBundle.from_result(
-                    command=envelope,
+            if existing_execution is not None:
+                return self._receipt_from_row(row)
+            session.add(
+                CausalExecutionBundleRecord(
                     execution_id=execution_id,
-                    result=loads(existing_execution.bundle_json).get("actual_result", result),
+                    command_id=envelope.command_id,
+                    epoch=envelope.epoch,
                     execution_sequence=execution_sequence,
+                    priority_sequence=int(priority_sequence),
+                    book_sequence=int(book_sequence),
+                    event_sequence=execution_sequence,
+                    accepted=bundle.accepted,
+                    rejected=bundle.rejected,
+                    result_hash=bundle.result_hash,
+                    bundle_json=canonical_json(bundle.as_dict()),
+                    state=normalized_status,
+                    created_at=now,
+                    durable_at=now,
                 )
+            )
+            row.execution_id = execution_id
+            row.result_hash = bundle.result_hash
             row.status = normalized_status
             row.ack_stage = ack_stage
             row.response_json = canonical_json(canonicalize_result(stored_response))
@@ -291,6 +289,8 @@ class CausalCommandService:
             row = await session.get(CausalCommandJournal, str(command_id))
             if row is None:
                 return None
+            if row.status in {"DURABLE", "PUBLISHED", "REJECTED"}:
+                return self._receipt_from_row(row)
             row.status = str(status)
             row.ack_stage = str(status)
             row.unknown_reason = str(reason)[:512]
@@ -360,7 +360,9 @@ class CausalCommandService:
             return self._receipt_from_row(row)
 
     def watermarks_snapshot(self) -> dict:
-        return self._watermarks.as_dict()
+        return {**self._watermarks.as_dict(),
+                "sequence_semantics": "maximum observed per named clock; not a contiguous commit frontier",
+                "replay_scope": "command receipts and execution bundles; no automatic matching replay"}
 
     async def _upsert_watermark(
         self,

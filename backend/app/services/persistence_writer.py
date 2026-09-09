@@ -81,6 +81,9 @@ class PersistenceWriter:
         self._materialize_batch_max = materialize_batch_max
         self._retention_seconds = retention_seconds
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=max_queue)
+        self._append_lock = asyncio.Lock()
+        self._append_jobs: set[asyncio.Task] = set()
+        self._append_receipts: dict[int, asyncio.Future] = {}
         self._worker_task: asyncio.Task | None = None
         self._materializer_task: asyncio.Task | None = None
         self._seq = 0
@@ -187,9 +190,9 @@ class PersistenceWriter:
         self._persisted_max_id = int(max_id or 0)
         self._robot_user_ids = {int(value) for value in robot_ids.scalars()}
         self._watermarks["materialized_seq"] = self._watermark
-        self._watermarks["durable_seq"] = int(exchange_max or self._persisted_max_id)
-        self._watermarks["ingress_seq"] = self._watermarks["durable_seq"]
-        self._watermarks["matched_seq"] = self._watermarks["durable_seq"]
+        self._watermarks["durable_seq"] = self._persisted_max_id
+        self._watermarks["ingress_seq"] = int(exchange_max or 0)
+        self._watermarks["matched_seq"] = 0  # Intent journal is not proof of matching.
         self._metrics["last_materialized_seq"] = self._watermark
         self._metrics["last_persisted_seq"] = self._persisted_max_id
         self._initialized = True
@@ -251,7 +254,7 @@ class PersistenceWriter:
         return replayed
 
     async def drain_append(self, timeout: float = 2.0) -> int:
-        """Append all currently queued events (tests / shutdown fallback)."""
+        """Wait for queued AND already-dequeued SQL appends to finish."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while not self._queue.empty() and loop.time() < deadline:
@@ -262,8 +265,66 @@ class PersistenceWriter:
                 except asyncio.QueueEmpty:
                     break
             if batch:
-                await self._append_batch(batch)
+                job = self._schedule_append_batch(batch, queued=True)
+                await asyncio.wait_for(asyncio.shield(job),
+                                       timeout=max(0.0, deadline - loop.time()))
+        await asyncio.wait_for(self._queue.join(), timeout=max(0.0, deadline - loop.time()))
+        # Direct QuoteSet tails do not enter _queue, but an already admitted
+        # batch must also finish before a drain can report an idle writer.
+        if self._append_jobs:
+            completed, pending = await asyncio.wait(tuple(self._append_jobs),
+                                                    timeout=max(0.0, deadline - loop.time()))
+            if pending:
+                raise TimeoutError("durable execution append is still in flight")
+            for job in completed:
+                job.result()
+        if self._blocked_task is not None or self._critical_blocked is not None:
+            raise RuntimeError("durable execution writer is halted")
         return self._queue.qsize()
+
+    async def _commit_append_batch(self, batch: list[dict], *, queued: bool = False):
+        # Cancellation/timeout of one API waiter cannot abort a shared append.
+        return await asyncio.shield(self._schedule_append_batch(batch, queued=queued))
+
+    def _schedule_append_batch(self, batch: list[dict], *, queued: bool = False):
+        # Register ownership synchronously after dequeue, before even a zero
+        # timeout can cancel the caller. No dequeued batch may lose its owner.
+        job = asyncio.create_task(self._commit_append_batch_owned(batch, queued=queued),
+                                  name="persistence-append-batch")
+        self._append_jobs.add(job)
+        def finished(done):
+            self._append_jobs.discard(done)
+            if not done.cancelled():
+                done.exception()
+        job.add_done_callback(finished)
+        return job
+
+    async def _commit_append_batch_owned(self, batch: list[dict], *, queued: bool):
+        try:
+            async with self._append_lock:
+                if self._blocked_task is not None or self._critical_blocked is not None:
+                    raise RuntimeError("durable execution writer is halted")
+                self._busy = True
+                try:
+                    return await self._append_batch(batch)
+                finally:
+                    self._busy = False
+        except BaseException as exc:
+            self._blocked_task = self._blocked_task or {**batch[-1], "error": str(exc)}
+            self._stopping = True
+            self._metrics["status"] = "HALTED"
+            self._metrics["failed"] += len(batch)
+            # Fail pending waiters explicitly; never use queue length or an
+            # unrelated MAX(id) as evidence for their particular execution.
+            for future in self._append_receipts.values():
+                if not future.done():
+                    future.set_exception(RuntimeError("durable execution append failed or was interrupted"))
+            self._append_receipts.clear()
+            raise
+        finally:
+            if queued:
+                for _ in batch:
+                    self._queue.task_done()
 
     async def flush(self, timeout: float = 30.0, *, materialize: bool = False) -> dict:
         """Drain the append queue; optionally wait for materialization catch-up."""
@@ -271,7 +332,7 @@ class PersistenceWriter:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            if self._queue.empty() and not self._busy and (
+            if self._queue.empty() and not self._busy and not self._append_jobs and (
                 not materialize or self.materialization_lag() <= 0
             ):
                 break
@@ -350,7 +411,10 @@ class PersistenceWriter:
                     if existing is not None:
                         return {
                             "event_id": int(existing.id),
-                            "durable_seq": int(existing.exchange_sequence or existing.id),
+                            "durable_seq": int(existing.exchange_sequence or 0),
+                            "exchange_sequence": int(existing.exchange_sequence or 0),
+                            "command_id": command_id, "ack_stage": "JOURNALED",
+                            "sequence_domain": "exchange_core_ingress",
                             "deduplicated": True,
                         }
                     now = datetime.now(tz=UTC)
@@ -398,12 +462,15 @@ class PersistenceWriter:
                 self._record_journal_commit(elapsed_ms)
                 durable_seq = int(record.get("exchange_sequence") or event_id)
                 self._persisted_max_id = max(self._persisted_max_id, event_id)
-                self._watermarks["durable_seq"] = max(self._watermarks["durable_seq"], durable_seq)
+                self._watermarks["durable_seq"] = self._persisted_max_id
                 self._watermarks["ingress_seq"] = max(self._watermarks["ingress_seq"], durable_seq)
                 self._metrics["persisted"] += 1
                 self._metrics["journal_commands"] += 1
                 self._metrics["last_persisted_seq"] = self._persisted_max_id
-                return {"event_id": event_id, "durable_seq": durable_seq, "deduplicated": False}
+                return {"event_id": event_id, "durable_seq": durable_seq, "deduplicated": False,
+                        "exchange_sequence": int(record["exchange_sequence"]),
+                        "command_id": command_id, "ack_stage": "JOURNALED",
+                        "sequence_domain": "exchange_core_ingress"}
             except Exception as exc:
                 if "database is locked" in str(exc).lower() and attempt < 11:
                     await asyncio.sleep(min(1.0, 0.05 * (attempt + 1)))
@@ -477,6 +544,22 @@ class PersistenceWriter:
     # ------------------------------------------------------------------
     # hot path (append-only event log)
     # ------------------------------------------------------------------
+    def _robot_memory_task(self, task: dict) -> bool:
+        user_id = int(task.get("user_id") or 0)
+        return (
+            (settings.persistence_mode == "memory" or platform_durable_contract())
+            and (task.get("ephemeral_robot_quote") is True or user_id > 0 and user_id in self._robot_user_ids)
+        )
+
+    def is_ephemeral_quote_task(self, task: dict) -> bool:
+        """The same no-write predicate used by enqueue; never drops real fills."""
+        if str(task.get("kind") or "") not in {"spot_amend", "contract_amend"}:
+            return False
+        if not self._robot_memory_task(task):
+            return False
+        result = task.get("engine_result") if isinstance(task.get("engine_result"), dict) else {}
+        return self._safe_ephemeral_quote_amend(task, result)
+
     def enqueue(self, task: dict) -> bool:
         captured = self._capture_var.get()
         if captured is not None:
@@ -485,30 +568,12 @@ class PersistenceWriter:
             return True
         task = dict(task)
         kind = str(task.get("kind") or "")
-        explicit_robot_quote = task.get("ephemeral_robot_quote") is True
-        task_user_id = int(task.get("user_id") or 0)
-        registered_robot_task = task_user_id > 0 and task_user_id in self._robot_user_ids
-        robot_memory_task = (
-            (settings.persistence_mode == "memory" or platform_durable_contract())
-            and (
-                explicit_robot_quote
-                or registered_robot_task
-            )
-        )
-        if robot_memory_task and kind in {"spot_place", "contract_place"}:
+        if kind in {"spot_place", "contract_place"} and self._robot_memory_task(task):
             # A previous restart-ephemeral quote with the same stable client id
             # may still exist in the durable view. Replay must replace it, not
             # report an idempotent success while leaving the engine level absent.
             task["allow_client_order_reuse"] = True
-        engine_result = task.get("engine_result") if isinstance(task.get("engine_result"), dict) else {}
-        if (
-            robot_memory_task
-            and kind in {
-                "spot_amend",
-                "contract_amend",
-            }
-            and self._safe_ephemeral_quote_amend(task, engine_result)
-        ):
+        if self.is_ephemeral_quote_task(task):
             # A simple no-fill requote changes only restart-ephemeral robot
             # animation. Real fills carry a maker pre-fill anchor that aligns
             # the durable order/reserve in the same replay transaction. Cancels,
@@ -534,28 +599,37 @@ class PersistenceWriter:
     async def enqueue_durable(self, task: dict, *, timeout: float = 5.0) -> dict:
         """Append a critical execution task and wait for its SQL commit.
 
-        Unified mode uses this barrier after the actual engine result is known.
-        It is intentionally separate from ``enqueue`` so legacy sampled quote
-        animation keeps its existing write-behind performance contract.
+        Financial executions use this barrier after the actual result is known.
+        Ordinary no-fill quote animation keeps its existing enqueue contract.
         """
 
+        if self.is_capturing():
+            raise RuntimeError("captured execution must use its outer durable batch")
+        if self._blocked_task is not None or self._critical_blocked is not None or self._stopping:
+            raise RuntimeError("durable execution writer is halted")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        previous = self._seq
         if not self.enqueue(task):
-            await self.drain_append(timeout=timeout)
+            await self.drain_append(timeout=max(0.0, deadline - loop.time()))
+            previous = self._seq
             if not self.enqueue(task):
                 raise RuntimeError("durable execution queue is full")
-        await self.drain_append(timeout=timeout)
+        if self._seq == previous:
+            raise RuntimeError("ephemeral execution has no durable append receipt")
+        receipt = loop.create_future()
+        receipt.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        self._append_receipts[self._seq] = receipt
+        if self._worker_task is None or self._worker_task.done():
+            await self.drain_append(timeout=max(0.0, deadline - loop.time()))
         if self._blocked_task is not None or self._critical_blocked is not None:
             raise RuntimeError("durable execution writer is halted")
-        if not self._queue.empty():
-            raise TimeoutError("durable execution commit timed out")
-        return {
-            "event_id": int(self._persisted_max_id),
-            "durable_seq": int(self._watermarks["durable_seq"] or self._persisted_max_id),
-        }
+        return await asyncio.wait_for(asyncio.shield(receipt), timeout=max(0.0, deadline - loop.time()))
 
     async def enqueue_durable_batch(self, tasks: list[dict], *, timeout: float = 5.0) -> dict:
         """Durably append a bounded QuoteSet execution tail in one SQL batch."""
-
+        if self._blocked_task is not None or self._critical_blocked is not None or self._stopping:
+            raise RuntimeError("durable execution writer is halted")
         batch: list[dict] = []
         for task in tasks:
             item = dict(task)
@@ -568,17 +642,14 @@ class PersistenceWriter:
             self._metrics["by_symbol"][symbol] = self._metrics["by_symbol"].get(symbol, 0) + 1
             self._metrics["by_kind"][kind] = self._metrics["by_kind"].get(kind, 0) + 1
         if batch:
-            self._busy = True
-            try:
-                await self._append_batch(batch)
-            finally:
-                self._busy = False
+            receipt = await asyncio.wait_for(asyncio.shield(self._schedule_append_batch(batch)), timeout=timeout)
+        else:
+            receipt = {"event_id": int(self._persisted_max_id), "durable_seq": int(self._watermarks["durable_seq"])}
         if self._blocked_task is not None or self._critical_blocked is not None:
             raise RuntimeError("durable execution writer is halted")
         return {
             "accepted": len(batch),
-            "event_id": int(self._persisted_max_id),
-            "durable_seq": int(self._watermarks["durable_seq"] or self._persisted_max_id),
+            **receipt,
         }
 
     @staticmethod
@@ -603,47 +674,56 @@ class PersistenceWriter:
                         batch.append(self._queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-                self._busy = True
                 try:
-                    await self._append_batch(batch)
-                finally:
-                    self._busy = False
+                    await self._commit_append_batch(batch, queued=True)
+                except Exception:
+                    # The batch owner already recorded the fail-closed state.
+                    break
                 self._metrics["queue_size"] = self._queue.qsize()
                 if self._stopping:
                     break
         finally:
             pass
 
-    async def _append_batch(self, batch: list[dict]) -> None:
+    async def _append_batch(self, batch: list[dict]) -> dict:
         last_exc: Exception | None = None
         for attempt in range(12):
+            committed = False
             try:
                 async with self._session_factory() as session:
                     now = datetime.now(tz=UTC)
+                    rows = []
                     for task in batch:
-                        session.add(
-                            DomainEventLog(
-                                created_at=now,
-                                product_type=self._product_type(task),
-                                symbol=str(task["symbol"]),
-                                user_id=int(task["user_id"]),
-                                kind=str(task["kind"]),
-                                payload_json=json.dumps(task, ensure_ascii=False, default=str),
-                                state="pending",
-                                command_type=str(task.get("kind") or "legacy"),
-                                sink_class="critical" if self._is_critical_task(task) else "non-critical",
-                            )
+                        row = DomainEventLog(
+                            created_at=now,
+                            product_type=self._product_type(task),
+                            symbol=str(task["symbol"]),
+                            user_id=int(task["user_id"]),
+                            kind=str(task["kind"]),
+                            payload_json=json.dumps(task, ensure_ascii=False, default=str),
+                            state="pending",
+                            command_type=str(task.get("kind") or "legacy"),
+                            sink_class="critical" if self._is_critical_task(task) else "non-critical",
                         )
+                        session.add(row)
+                        rows.append(row)
+                    await session.flush()
+                    event_ids = [int(row.id) for row in rows]
                     await session.commit()
-                    max_id = await session.scalar(select(func.max(DomainEventLog.id)))
-                self._persisted_max_id = max(self._persisted_max_id, int(max_id or 0))
+                    committed = True
+                self._persisted_max_id = max(self._persisted_max_id, max(event_ids))
+                self._watermarks["durable_seq"] = self._persisted_max_id
                 self._metrics["persisted"] += len(batch)
                 self._metrics["last_persisted_seq"] = self._persisted_max_id
                 self._metrics["batch_count"] += 1
-                return
+                for task, event_id in zip(batch, event_ids):
+                    future = self._append_receipts.pop(int(task["_seq"]), None)
+                    if future is not None and not future.done():
+                        future.set_result({"event_id": event_id, "durable_seq": event_id})
+                return {"event_id": event_ids[-1], "durable_seq": event_ids[-1]}
             except Exception as exc:
                 last_exc = exc
-                if "database is locked" in str(exc).lower():
+                if not committed and "database is locked" in str(exc).lower():
                     await asyncio.sleep(min(1.0, 0.05 * (attempt + 1)))
                     continue
                 break
@@ -652,9 +732,7 @@ class PersistenceWriter:
             len(batch),
             last_exc,
         )
-        self._metrics["failed"] += len(batch)
-        self._blocked_task = batch[-1]
-        self._stopping = True
+        raise RuntimeError("domain event append failed after retries") from last_exc
 
     @staticmethod
     def _product_type(task: dict) -> str:
@@ -840,10 +918,10 @@ class PersistenceWriter:
         self._metrics["last_materialized_seq"] = self._watermark
         self._metrics["last_materialized_at"] = datetime.now(tz=UTC).isoformat()
         self._metrics["materialize_batch_count"] += 1
-        max_exchange_sequence = max((int(event.get("exchange_sequence") or event["id"]) for event in events), default=0)
-        self._watermarks["materialized_seq"] = max(self._watermarks["materialized_seq"], max_exchange_sequence)
+        max_event_id = read_last_id  # All materialized rows share the DomainEventLog.id clock.
+        self._watermarks["materialized_seq"] = max(self._watermarks["materialized_seq"], max_event_id)
         self._watermarks["critical_materialized_seq"] = max(
-            self._watermarks["critical_materialized_seq"], max_exchange_sequence
+            self._watermarks["critical_materialized_seq"], max_event_id
         )
         self._critical_blocked = None
         if self._blocked_task is not None and self._blocked_task.get("event_id") in {
@@ -1535,9 +1613,14 @@ class PersistenceWriter:
         snapshot["robot_flow_synthetic_kline_intervals_persisted"] = ["1m", "5m"]
         snapshot["robot_flow_persistence_dropped_metrics_legacy"] = True
         snapshot["queue_size"] = self._queue.qsize()
+        snapshot["pending_append_receipts"] = len(self._append_receipts)
+        snapshot["append_batches_inflight"] = len(self._append_jobs)
         snapshot["materialization_lag"] = self.materialization_lag()
         snapshot["dead_letter"] = len(self._dead_letter)
         snapshot["watermarks"] = dict(self._watermarks)
+        snapshot["watermark_domains"] = {"durable_seq": "domain_event_log_id", "materialized_seq": "domain_event_log_id",
+                                        "critical_materialized_seq": "domain_event_log_id", "ingress_seq": "core_ingress_max",
+                                        "matched_seq": "core_ingress_max", "published_seq": "core_ingress_max"}
         snapshot["ingress_seq"] = self._watermarks["ingress_seq"]
         snapshot["matched_seq"] = self._watermarks["matched_seq"]
         snapshot["durable_seq"] = self._watermarks["durable_seq"]

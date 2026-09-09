@@ -850,6 +850,10 @@ async def _bootstrap_test_lab(session: AsyncSession) -> None:
 
 
 async def bootstrap(session: AsyncSession, runtime: AppRuntime) -> None:
+    if settings.instance_profile_path:
+        from app.services.instance_profile import bootstrap_instance_profile
+        await bootstrap_instance_profile(session, runtime)
+        return
     if platform_durable_contract():
         # 一体化平台（durable）：白标产品面（listed 市场/用户/品牌）+
         # 策略实验面（test 市场/机器人账号/API 测试账号）同库共存。

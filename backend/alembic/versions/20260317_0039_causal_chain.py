@@ -131,11 +131,8 @@ def upgrade() -> None:
         "exchange_snapshot_record",
         sa.Column("committed", sa.Boolean(), nullable=False, server_default=sa.true()),
     )
-    bind = op.get_bind()
-    if bind.dialect.name == "sqlite":
-        # One bounded database-level transition during migration; pooled
-        # connections must not repeat PRAGMA journal_mode=WAL concurrently.
-        bind.exec_driver_sql("PRAGMA journal_mode=WAL")
+    # Journal mode is initialized and verified by alembic/env.py outside the
+    # migration transaction, including databases already at this revision.
 
 
 def downgrade() -> None:

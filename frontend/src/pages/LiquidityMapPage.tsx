@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useLiveMakerSymbols } from "../hooks/useLiveMakerSymbols";
 import { useSearchParams } from "react-router-dom";
-import { config } from "../lib/config";
+import { config, appBasePath } from "../lib/config";
 
 export function LiquidityMapPage() {
   const live = useLiveMakerSymbols();
@@ -13,7 +13,7 @@ export function LiquidityMapPage() {
   const origin = new URL(config.apiBaseUrl, window.location.origin).origin;
   return <iframe ref={frame} onLoad={publishLive}
     title="沙盒流动性地图"
-    src={`${origin}/liquidity-map/?symbol=${encodeURIComponent(symbol)}`}
+    src={`${origin}${appBasePath}/liquidity-map/?symbol=${encodeURIComponent(symbol)}`}
     className="w-full border-0 rounded-xl"
     style={{ height: "calc(100dvh - 100px)", minHeight: 540 }}
   />;

@@ -110,6 +110,24 @@ class ContractPriceService:
             await session.flush()
         return state
 
+    async def _read_state_projection(self, session: AsyncSession, market: Market) -> ContractMarketState:
+        """One detached display projection; GET requests never create state."""
+        with session.no_autoflush:
+            current = await session.scalar(
+                select(ContractMarketState).where(ContractMarketState.market_id == market.id)
+            )
+        if current is not None:
+            return ContractMarketState(**{
+                column.key: getattr(current, column.key)
+                for column in ContractMarketState.__table__.columns
+            })
+        return ContractMarketState(
+            market_id=market.id,
+            index_price=market.reference_price or ZERO,
+            external_mark_price=ZERO,
+            funding_rate=market.funding_rate or ZERO,
+        )
+
     async def fetch_binance_premium_index(self, index_symbol: str) -> ExternalPremiumIndex:
         query = urllib.parse.urlencode({"symbol": index_symbol.upper()})
         url = f"{BINANCE_PREMIUM_INDEX_URL}?{query}"
@@ -165,9 +183,15 @@ class ContractPriceService:
             return ZERO
         return filled_notional / filled_qty
 
-    async def local_book_prices(self, market: Market, index_price: Decimal, state: ContractMarketState) -> dict[str, Decimal]:
+    async def local_book_prices(
+        self, market: Market, index_price: Decimal, state: ContractMarketState,
+        *, book_snapshot: dict[str, list[list[str]]] | None = None,
+    ) -> dict[str, Decimal]:
         symbol = market.symbol
-        book, _, _ = await self.runtime.orderbook_snapshot(symbol, 50)
+        if book_snapshot is None:
+            book, _, _ = await self.runtime.orderbook_snapshot(symbol, 50)
+        else:
+            book = book_snapshot
         bids = book["bids"]
         asks = book["asks"]
         best_bid = to_decimal(bids[0][0]) if bids else ZERO
@@ -220,10 +244,24 @@ class ContractPriceService:
         market: Market,
         *,
         fetch_external: bool = True,
+        external_result: tuple[ExternalPremiumIndex | None, str, str] | None = None,
+        persist: bool = True,
     ) -> ContractMarketState:
         if market.product_type != PRODUCT_TYPE_PERP:
             raise ValueError("contract market state is only available for PERP markets")
-        state = await self.get_state(session, market)
+        # get_state may INSERT a new row. Finish network I/O before that can
+        # acquire SQLite's writer lock, including the first refresh of a market.
+        external, source_status, source_message = (
+            external_result if external_result is not None
+            else await self._external_refresh(market, fetch_external=fetch_external)
+        )
+        # The cold snapshot fallback acquires the market lock. Resolve it before
+        # get_state can start a write transaction for a newly added market.
+        book_snapshot, _, _ = await self.runtime.orderbook_snapshot(market.symbol, 50)
+        state = (
+            await self.get_state(session, market) if persist
+            else await self._read_state_projection(session, market)
+        )
         state.index_symbol = self.binance_index_symbol(market)
         state.index_source = market.index_price_source
         state.mark_source = market.mark_price_mode
@@ -233,26 +271,19 @@ class ContractPriceService:
         state.funding_cap_rate = market.funding_cap_rate
         state.impact_notional = market.funding_impact_notional
 
-        external: ExternalPremiumIndex | None = None
-        source_message = "using local fallback"
-        source_status = "fallback"
-        if fetch_external and market.index_price_source == INDEX_PRICE_SOURCE_BINANCE:
-            try:
-                external = await self.fetch_binance_premium_index(state.index_symbol)
-                state.index_price = external.index_price
-                state.external_mark_price = external.external_mark_price
-                state.external_updated_at = external.timestamp or datetime.now(tz=UTC)
-                state.next_funding_time = external.next_funding_time
-                if external.interest_rate > ZERO:
-                    state.interest_rate = external.interest_rate
-                source_status = "external_ok"
-                source_message = "binance premiumIndex synced"
-            except Exception as exc:
-                source_message = f"binance premiumIndex unavailable: {exc.__class__.__name__}"
+        if external is not None:
+            state.index_price = external.index_price
+            state.external_mark_price = external.external_mark_price
+            state.external_updated_at = external.timestamp or datetime.now(tz=UTC)
+            state.next_funding_time = external.next_funding_time
+            if external.interest_rate > ZERO:
+                state.interest_rate = external.interest_rate
 
         if Decimal(state.index_price or ZERO) <= ZERO:
             state.index_price = market.reference_price or ZERO
-        local = await self.local_book_prices(market, Decimal(state.index_price or ZERO), state)
+        local = await self.local_book_prices(
+            market, Decimal(state.index_price or ZERO), state, book_snapshot=book_snapshot
+        )
         state.index_price = quantize_scale(local["index_price"], market.price_precision)
         state.mark_price = local["mark_price"]
         state.local_mid_price = local["local_mid_price"]
@@ -268,13 +299,27 @@ class ContractPriceService:
         state.source_status = source_status
         state.source_message = source_message
         state.updated_at = datetime.now(tz=UTC)
-        market.funding_rate = state.funding_rate
+        # Fresh price observations keep their existing in-memory risk meaning.
+        # A display GET must not depend on a SQL write to refresh the mark.
         self.runtime.contract_price_snapshots[market.symbol] = self.serialize_state(state, market)
-        now_ms = to_millis(state.updated_at)
-        if now_ms - self.runtime.contract_price_persist_ms.get(market.symbol, 0) >= 1000:
-            await session.flush()
-            self.runtime.contract_price_persist_ms[market.symbol] = now_ms
+        if persist:
+            market.funding_rate = state.funding_rate
+            now_ms = to_millis(state.updated_at)
+            if now_ms - self.runtime.contract_price_persist_ms.get(market.symbol, 0) >= 1000:
+                await session.flush()
+                self.runtime.contract_price_persist_ms[market.symbol] = now_ms
         return state
+
+    async def _external_refresh(
+        self, market: Market, *, fetch_external: bool
+    ) -> tuple[ExternalPremiumIndex | None, str, str]:
+        if fetch_external and market.index_price_source == INDEX_PRICE_SOURCE_BINANCE:
+            try:
+                external = await self.fetch_binance_premium_index(self.binance_index_symbol(market))
+                return external, "external_ok", "binance premiumIndex synced"
+            except Exception as exc:
+                return None, "fallback", f"binance premiumIndex unavailable: {exc.__class__.__name__}"
+        return None, "fallback", "using local fallback"
 
     def serialize_state(self, state: ContractMarketState, market: Market) -> dict:
         return {
@@ -310,8 +355,9 @@ class ContractPriceService:
         market: Market,
         *,
         fetch_external: bool = False,
+        persist: bool = True,
     ) -> dict:
-        state = await self.refresh_market_state(session, market, fetch_external=fetch_external)
+        state = await self.refresh_market_state(session, market, fetch_external=fetch_external, persist=persist)
         return self.serialize_state(state, market)
 
     async def settle_funding(
@@ -322,6 +368,8 @@ class ContractPriceService:
         funding_time: datetime | None = None,
         fetch_external: bool = True,
     ) -> dict:
+        external_result = await self._external_refresh(market, fetch_external=fetch_external)
+
         async def keys() -> list[str]:
             rows = await session.execute(
                 select(ContractPosition.user_id).where(
@@ -333,12 +381,19 @@ class ContractPriceService:
             return [f"contract:{int(user_id)}:{asset}" for user_id in sorted(rows.scalars())]
 
         async with self.runtime.market_financial_guard(market.symbol, keys):
-            return await self._settle_funding_locked(
-                session,
-                market,
-                funding_time=funding_time,
-                fetch_external=fetch_external,
-            )
+            try:
+                return await self._settle_funding_locked(
+                    session,
+                    market,
+                    funding_time=funding_time,
+                    fetch_external=fetch_external,
+                    external_result=external_result,
+                )
+            except BaseException:
+                # Do not expose the market/account locks while the failed
+                # funding transaction still owns SQLite's writer lock.
+                await session.rollback()
+                raise
 
     async def _settle_funding_locked(
         self,
@@ -347,8 +402,11 @@ class ContractPriceService:
         *,
         funding_time: datetime | None = None,
         fetch_external: bool = True,
+        external_result: tuple[ExternalPremiumIndex | None, str, str] | None = None,
     ) -> dict:
-        state = await self.refresh_market_state(session, market, fetch_external=fetch_external)
+        state = await self.refresh_market_state(
+            session, market, fetch_external=fetch_external, external_result=external_result
+        )
         funding_time = self.resolve_funding_time(market, funding_time)
         settlement, acquired = await self.reserve_funding_settlement(session, market, state, funding_time)
         if not acquired:

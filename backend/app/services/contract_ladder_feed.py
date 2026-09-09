@@ -38,6 +38,22 @@ class LadderFeed:
         self._verified = None
         self._rest_required = False
         self._last_rest_attempt = float("-inf")
+        self.on_change = None
+        self._notified_quote = None
+
+    def _notify_change(self):
+        # Optional consumer wakeup, never a task or an event queue. Quantity-only
+        # WS messages refresh evidence without replanning a price-only ladder.
+        if self.on_change is None:
+            return
+        current = self.snapshot()
+        quote = current.get("observation") or {}
+        key = (current["state"], current["can_quote"],
+               Decimal(quote["bid"]) if quote else None, Decimal(quote["ask"]) if quote else None,
+               quote.get("source_session"))
+        if key != self._notified_quote:
+            self._notified_quote = key
+            self.on_change()
 
     def configure(self, settings):
         if set(settings) != set(self._settings):
@@ -103,6 +119,7 @@ class LadderFeed:
             self.ws = None
             self._verified = None
             self._rest_required = True
+            self._notify_change()
             return False
         observation = {**quantities, "exchange": "BINANCE", "symbol": self.symbol, "transport": transport,
                        "bid": str(bid), "ask": str(ask), "source_session": session or self.session,
@@ -132,6 +149,7 @@ class LadderFeed:
                     self._rest_required = True
         self.invalid_reason = None
         self._invalid_at = None
+        self._notify_change()
         return True
 
     def _current_ws(self):
@@ -197,6 +215,7 @@ class LadderFeed:
             finally:
                 self.connected = False
                 self._rest_required = True
+                self._notify_change()
             await asyncio.sleep(1)
 
     async def _rest_loop(self):

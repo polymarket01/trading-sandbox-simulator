@@ -24,6 +24,7 @@ from app.core.constants import PRODUCT_TYPE_PERP, PRODUCT_TYPE_SPOT, ROLE_BOT, Z
 from app.core.security import hash_session_token, verify_ws_signature
 from app.core.time_utils import to_millis
 from app.db.session import SessionLocal
+from app.db.sqlite_startup import initialize_sqlite_wal
 from app.models.market import Market
 from app.models.contract_account import ContractAccount
 from app.models.contract_position import ContractPosition
@@ -358,35 +359,29 @@ async def history_storage_guard_loop(app: FastAPI) -> None:
 
 
 async def display_kline_persist_loop(app: FastAPI) -> None:
-    """Persist synthetic public candles at aggregate cadence, never per order."""
+    """Low-frequency closed-minute history, isolated from matching writes."""
     while True:
         try:
-            if not settings.display_kline_persistence_enabled:
+            if not platform_durable_contract() and not settings.display_kline_persistence_enabled:
                 await asyncio.sleep(60)
                 continue
             runtime: AppRuntime = app.state.runtime
+            tickets = []
             async with SessionLocal() as session:
-                markets = list(
-                    (
-                        await session.execute(
-                            select(Market).where(Market.is_active.is_(True))
-                        )
-                    ).scalars()
-                )
+                markets = list((await session.scalars(select(Market).where(Market.is_active.is_(True)))).all())
                 for market in markets:
-                    for interval in ("1m", "5m"):
-                        await runtime.market_data.persist_display_kline(
-                            session,
-                            int(market.id),
-                            market.symbol,
-                            interval,
-                        )
+                    if platform_durable_contract():
+                        tickets.extend(await runtime.market_data.persist_closed_minutes(session, int(market.id), market.symbol))
+                    else:
+                        for interval in ("1m", "5m"):
+                            await runtime.market_data.persist_display_kline(session, int(market.id), market.symbol, interval)
                 await session.commit()
-            await asyncio.sleep(max(1.0, settings.kline_persist_min_interval_ms / 1000))
+            runtime.market_data.acknowledge_closed_minutes(tickets)
+            await asyncio.sleep(10)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logging.getLogger("display_kline").exception("display K-line persistence loop failed")
+            logging.getLogger("display_kline").exception("minute K-line persistence failed; retrying without advancing checkpoint")
             await asyncio.sleep(3)
 
 
@@ -977,6 +972,14 @@ async def retire_paper_quote_orders(
 async def lifespan(app: FastAPI):
     sqlite_worker_guard = SQLiteWorkerGuard(settings.database_url)
     sqlite_worker_guard.acquire()
+    try:
+        initialize_sqlite_wal(
+            settings.database_url,
+            busy_timeout_ms=settings.sqlite_busy_timeout_ms,
+        )
+    except BaseException:
+        sqlite_worker_guard.release()
+        raise
     runtime = AppRuntime()
     history_path = Path(settings.history_db_path)
     if not history_path.is_absolute():
@@ -1017,6 +1020,8 @@ async def lifespan(app: FastAPI):
     contract_maintenance_service = ContractMaintenanceService(runtime, contract_service, contract_price_service)
     contract_liquidity_service = ContractLiquidityService(runtime, contract_service, contract_price_service)
     bot_orchestrator_service = BotOrchestratorService(runtime)
+    from app.services.public_trade_tape import PublicTradeTape
+    runtime.public_trade_tape = await asyncio.to_thread(PublicTradeTape, Path(settings.sandbox_data_dir) / "public_virtual_trades.db")
     app.state.runtime = runtime
     app.state.order_service = order_service
     app.state.contract_service = contract_service
@@ -1208,12 +1213,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan, title=settings.app_name)
+from app.services.matching_faults import MatchingHalted
+
+
+@app.exception_handler(MatchingHalted)
+async def matching_halted_response(_request, exc):
+    return ORJSONResponse(status_code=503, content={"status": "NOT_EXECUTED", "code": "MATCHING_HALTED",
+                                                  "scope": "instance", "reason": str(exc)})
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+from app.api.market_data import router as market_data_router
+app.include_router(market_data_router, prefix=settings.api_prefix)
 app.include_router(public.router, prefix=settings.api_prefix)
 app.include_router(auth.router, prefix=settings.api_prefix)
 app.include_router(private.router, prefix=settings.api_prefix)
@@ -1234,12 +1249,16 @@ if (FRONTEND_DIST_DIR / "assets").exists():
 
 @app.get("/health")
 async def health():
+    from app.db.sqlite_observability import sqlite_observability_snapshot
+
     runtime = getattr(app.state, "runtime", None)
     writer = getattr(runtime, "persistence_writer", None) if runtime is not None else None
     if writer is None:
+        fault = getattr(getattr(runtime, "engine", None), "fault", None)
         return ORJSONResponse(
             status_code=503,
-            content={"ok": False, "status": "STARTING", "reason": "persistence_writer_unavailable"},
+            content={"ok": False, "status": "HALTED" if fault is not None and fault.halted else "STARTING",
+                     "reason": fault.reason if fault is not None and fault.halted else "persistence_writer_unavailable"},
         )
     metrics = writer.metrics_snapshot()
     parent_watch = getattr(app.state, "runner_parent_watch", {"enabled": False})
@@ -1249,8 +1268,10 @@ async def health():
     storage_degraded = bool(getattr(runtime, "storage_degraded", False))
     history_store = getattr(runtime, "history_store", None)
     storage_metrics = history_store.metrics_snapshot() if history_store is not None else {}
+    matching_fault = runtime.engine.fault
     healthy = (
-        not bool(getattr(writer, "_stopping", False))
+        not matching_fault.halted
+        and not bool(getattr(writer, "_stopping", False))
         and getattr(writer, "_blocked_task", None) is None
         and getattr(writer, "_critical_blocked", None) is None
         and not parent_lost
@@ -1259,13 +1280,17 @@ async def health():
     payload = {
         "ok": healthy,
         "status": (
-            "RUNNER_PARENT_LOST"
+            "HALTED"
+            if matching_fault.halted
+            else "RUNNER_PARENT_LOST"
             if parent_lost
             else "STORAGE_DEGRADED"
             if storage_degraded
             else metrics.get("status")
         ),
-        "reason": "runner_parent_lost" if parent_lost else None,
+        "reason": matching_fault.reason if matching_fault.halted else "runner_parent_lost" if parent_lost else None,
+        "matching_gate": matching_fault.snapshot(),
+        "sqlite": sqlite_observability_snapshot(),
         "persistence_queue": metrics.get("queue_size", 0),
         "materialization_lag": metrics.get("materialization_lag", 0),
         "critical_sink": writer.critical_sink_status(),
@@ -1431,6 +1456,10 @@ async def ws_private(websocket: WebSocket):
                     else:
                         await websocket.send_json({"type": "error", "detail": "authenticate first"})
                         continue
+                from app.api.deps import bot_request_allowed
+                if user.role == "mm_bot" and not bot_request_allowed(websocket):
+                    await websocket.send_json({"type": "error", "detail": "internal bot API is not public"})
+                    continue
                 await runtime.ws.auth_private(websocket, user.id)
                 await websocket.send_json({"type": "auth_ok"})
             elif message.get("op") == "subscribe":

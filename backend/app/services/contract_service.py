@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.matching_faults import BusinessRejected, NotExecuted
+
 from app.services.maker_permissions import min_notional_exempt
 
 import asyncio
@@ -53,6 +55,7 @@ from app.models.market_bot_account import MarketBotAccount
 from app.models.order import Order
 from app.models.trade import Trade
 from app.models.user import User
+from app.services.contract_netting import split_fill, required_reserves
 from app.services.ids import next_liquidation_id, next_order_id, next_trade_id
 from app.services.contract_ledger import add_contract_ledger_entry, snapshot_contract_account
 from app.services.contract_insurance import cover_contract_bad_debt
@@ -89,7 +92,7 @@ CONTRACT_DEMO_WALLET = Decimal("1000000")
 CONTRACT_EPSILON = Decimal("1e-10")
 
 
-class ContractValidationError(Exception):
+class ContractValidationError(BusinessRejected):
     pass
 
 
@@ -196,6 +199,209 @@ class ContractService:
         await session.flush()
         return row
 
+    async def preflight_ladder_user_fills(self, session: AsyncSession, market: Market, fills, *, taker_order=None) -> None:
+        """Check position transitions before matching, under the financial guard.
+
+        Resting orders can outlive the position state that admitted them. Only
+        the candidate fills' users are read; scalar projections never dirty ORM
+        rows or re-run matching, and internal LADDER accounts have no position.
+        """
+        if not fills:
+            return
+        orders = await self.load_orders_map(session, {fill.maker_order_id for fill in fills})
+        taker_id = taker_order.order_id if taker_order is not None else None
+        if taker_order is not None and not await self.is_contract_ladder(session, taker_order.user_id, market.id):
+            orders[taker_id] = taker_order
+            expanded = []
+            for fill in fills:
+                expanded.append(fill)
+                expanded.append(SimpleNamespace(maker_order_id=taker_id, maker_user_id=taker_order.user_id,
+                    price=fill.price, quantity=fill.quantity))
+            fills = expanded
+        fills = [fill for fill in fills if not await self.is_contract_ladder(session, fill.maker_user_id, market.id)]
+        users = {int(fill.maker_user_id) for fill in fills}
+        modes = dict((await session.execute(
+            select(ContractUserSetting.user_id, ContractUserSetting.position_mode).where(
+                ContractUserSetting.market_id == market.id, ContractUserSetting.user_id.in_(users)
+            )
+        )).all())
+        positions = (await session.execute(
+            select(ContractPosition.user_id, ContractPosition.side, ContractPosition.quantity,
+                   ContractPosition.entry_price, ContractPosition.isolated_margin).where(
+                ContractPosition.market_id == market.id, ContractPosition.user_id.in_(users),
+                *ContractPosition.active_filters(),
+            )
+        )).all()
+        projected = {}
+        finances = {}
+        for uid in users:
+            account = await session.scalar(select(ContractAccount).where(
+                ContractAccount.user_id == uid, ContractAccount.margin_asset == (market.margin_asset or market.quote_asset)))
+            if account is None:
+                raise ContractValidationError("maker account is not ready")
+            finances[uid] = [Decimal(account.wallet_balance), Decimal(account.used_margin), Decimal(account.unrealized_pnl)]
+        details = {}
+        rates = {}
+        for uid, side, quantity, entry, margin in positions:
+            key = (int(uid), side if modes.get(uid) == POSITION_MODE_HEDGE else None)
+            if key in projected:
+                raise ContractValidationError("maker position mode conflicts with current positions")
+            projected[key] = (side, self._position_qty_without_storage_dust(market, quantity))
+            details[key] = (Decimal(entry), Decimal(margin))
+        consumed = {}
+        for fill in fills:
+            try:
+                order = orders.get(fill.maker_order_id)
+                if (order is None or int(order.user_id) != int(fill.maker_user_id)
+                        or int(order.market_id) != int(market.id) or order.product_type != PRODUCT_TYPE_PERP):
+                    raise ContractValidationError("maker financial state is not ready")
+                if order.status not in {ORDER_STATUS_NEW, ORDER_STATUS_PARTIALLY_FILLED}:
+                    raise ContractValidationError("maker order is no longer live")
+                consumed[order.order_id] = consumed.get(order.order_id, ZERO) + fill.quantity
+                if consumed[order.order_id] > self._position_qty_without_storage_dust(market, order.remaining_quantity):
+                    raise ContractValidationError("maker financial leaves are not ready")
+                action = order.position_action or POSITION_ACTION_OPEN
+                target = self.order_position_side(order.side, action)
+                key = (int(order.user_id), target if modes.get(order.user_id) == POSITION_MODE_HEDGE else None)
+                side, quantity = projected.get(key, (POSITION_SIDE_FLAT, ZERO))
+                try:
+                    split = split_fill(side=order.side, action=action, reduce_only=bool(order.reduce_only),
+                        hedge=modes.get(order.user_id) == POSITION_MODE_HEDGE,
+                        position_side=side, position_qty=quantity, quantity=fill.quantity)
+                except ValueError as exc:
+                    raise ContractValidationError(str(exc)) from exc
+                if not market.is_active or market.contract_trading_mode == CONTRACT_TRADING_MODE_PAUSED:
+                    raise ContractValidationError("contract market is paused or inactive")
+                restricted = (market.contract_trading_mode == CONTRACT_TRADING_MODE_REDUCE_ONLY or
+                    (market.is_listed and market.paper_status in {"REDUCE_ONLY", "DELISTING"}))
+                if split.opened and restricted:
+                    raise ContractValidationError("contract market is reduce-only")
+                entry, margin = details.get(key, (ZERO, ZERO))
+                mark = self.mark_price(market)
+                sign = 1 if side == POSITION_SIDE_LONG else -1
+                old_unrealized = (mark - entry) * quantity * sign if quantity else ZERO
+                realized = (fill.price - entry) * split.close * sign
+                released = margin * split.close / quantity if quantity else ZERO
+                added = fill.price * split.opened / Decimal(order.leverage or market.default_leverage)
+                rate_key = (order.user_id, order.order_id == taker_id)
+                if rate_key not in rates:
+                    rates[rate_key] = await self.get_fee_rate(session, order.user_id, market.id, taker=rate_key[1], market=market)
+                fee = fill.price * fill.quantity * rates[rate_key]
+                cash = finances[order.user_id]
+                cash[0] += realized - fee
+                cash[1] += added - released - self.reserved_margin_for_fill(order, fill.quantity, fill.price)
+                remaining = quantity - split.close
+                new_qty = remaining + split.opened
+                new_entry = ((entry * remaining + fill.price * split.opened) / new_qty) if new_qty else ZERO
+                new_side = self.order_position_side(order.side, POSITION_ACTION_OPEN) if split.opened else side
+                new_unrealized = (mark-new_entry)*new_qty*(1 if new_side == POSITION_SIDE_LONG else -1) if new_qty else ZERO
+                cash[2] += new_unrealized - old_unrealized
+                if split.opened and cash[0] + cash[2] - cash[1] < -CONTRACT_EPSILON:
+                    raise ContractValidationError("insufficient margin for projected fill and fee")
+                if cash[0] < -CONTRACT_EPSILON:
+                    raise ContractValidationError("insufficient wallet for projected fill and fee")
+                if split.opened:
+                    tier = await self.risk_tier_for_notional(session, market, max(mark, fill.price)*new_qty)
+                    if Decimal(order.leverage or market.default_leverage) > min(Decimal(market.max_leverage), Decimal(tier.max_leverage)):
+                        raise ContractValidationError("projected fill exceeds risk tier leverage")
+                details[key] = (new_entry, margin - released + added)
+                opened_side = self.order_position_side(order.side, POSITION_ACTION_OPEN)
+                projected[key] = ((opened_side, remaining + split.opened) if split.opened else
+                                  (side, remaining) if remaining > CONTRACT_EPSILON else (POSITION_SIDE_FLAT, ZERO))
+            except ContractValidationError as exc:
+                exc.order_id = fill.maker_order_id
+                raise
+
+    @staticmethod
+    def _expire_financial_reads(session):
+        for obj in list(session.identity_map.values()):
+            if isinstance(obj, (ContractAccount, ContractPosition, ContractUserSetting, Order)) and obj not in session.dirty:
+                session.expire(obj)
+
+    async def prepare_resting_fills(self, session, market, preview):
+        """Under financial + writer admission, retire an unexecutable candidate.
+
+        Must run BEFORE creating/reserving a taker. Each cancellation is a
+        confirmed standalone lifecycle transaction; reacquire the writer and
+        project again before allowing a subsequent matching command.
+        """
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+        while True:
+            fills = [f for f in preview() if not await self.is_contract_ladder(session, f.maker_user_id, market.id)]
+            try:
+                await self.preflight_ladder_user_fills(session, market, fills)
+                return
+            except ContractValidationError as exc:
+                oid = getattr(exc, "order_id", None)
+                if oid is None or not market.is_active or market.contract_trading_mode == CONTRACT_TRADING_MODE_PAUSED:
+                    raise
+                order = await session.scalar(select(Order).where(Order.order_id == oid))
+                if order is None:
+                    raise
+                account = await self.get_account(session, order.user_id, market.margin_asset or market.quote_asset)
+                before = snapshot_contract_account(account)
+                if order.status in {ORDER_STATUS_NEW, ORDER_STATUS_PARTIALLY_FILLED}:
+                    release = self.reserved_margin_for_fill(order, Decimal(order.remaining_quantity), Decimal(order.price or order.reference_price or ZERO))
+                    account.used_margin = Decimal(account.used_margin) - release
+                    order.reserved_margin = ZERO
+                    order.status = ORDER_STATUS_CANCELED
+                    order.reject_reason = str(exc)[:128]
+                    order.canceled_at = datetime.now(tz=UTC)
+                    order.updated_at = order.canceled_at
+                    order.version = int(order.version or 0) + 1
+                    await self.refresh_account(session, account)
+                    await add_contract_ledger_entry(session, account, change_type="margin_release", amount=ZERO,
+                        before=before, market_id=market.id, related_order_id=oid, note="contract_unexecutable_leaves_cancel")
+                # Commit facts first: failure cannot silently remove a book order.
+                await session.commit()
+                side_name, _, changes = self.runtime.engine.cancel_order(market.symbol, oid)
+                self._fast_contract_orders.pop(oid, None)
+                self._fast_unregister_client_id(order.user_id, market.id, order.client_order_id, oid)
+                self.runtime.acknowledge_committed_lifecycle(market.symbol)
+                try:
+                    await self.broadcast_order_flow(session, market.symbol, [order], {order.user_id},
+                        changes if side_name == SIDE_BUY else [], changes if side_name == SIDE_SELL else [], [])
+                except Exception:
+                    logging.getLogger("contract_service").exception("confirmed lifecycle cancel broadcast failed: %s", oid)
+                await acquire_sqlite_write_admission(session, existing_order_id=oid)
+                market = await session.get(Market, market.id, populate_existing=True)
+
+    def _ordinary_preview(self, market, payload, user):
+        context = self._stp_context(user)
+        return self.runtime.engine.ensure_market(market.symbol).preview_bbo_order(
+            side=payload.side, quantity=Decimal(payload.quantity),
+            limit_price=Decimal(payload.price) if payload.price is not None else Decimal("Infinity") if payload.side == SIDE_BUY else ZERO,
+            taker_account_key=context["stp_account_key"], taker_is_bot=context["stp_is_bot"],
+            stp_policy=context["stp_policy"]).fills
+
+    async def _preflight_user_makers(self, session, market, *, side, quantity, price,
+                                    margin_guard=False, stp_context=None, taker_order=None) -> None:
+        """Reject a stale resting position before a normal user command matches."""
+        book = self.runtime.engine.ensure_market(market.symbol)
+        best = book._best_level(SIDE_SELL if side == SIDE_BUY else SIDE_BUY)
+        if best is None or (price is not None and (
+                (side == SIDE_BUY and best[0] > price) or (side == SIDE_SELL and best[0] < price))):
+            return
+        context = stp_context or {}
+        preview = book.preview_bbo_order(side=side, quantity=quantity,
+            limit_price=price if price is not None else Decimal("Infinity") if side == SIDE_BUY else ZERO,
+            maker_guard=(lambda _oid, uid, _price, _qty: self._contract_maker_margin_ok(uid, int(market.id))) if margin_guard else None,
+            taker_account_key=context.get("stp_account_key"), taker_is_bot=context.get("stp_is_bot", False),
+            stp_policy=context.get("stp_policy") or SelfTradePolicy(same_account_mode=context.get("stp_mode", "cancel_taker")))
+        # The preview stops at an insolvent maker; the live matcher may remove
+        # it and proceed farther. Do not execute a financial range not checked.
+        if preview.stop_reason == "maker_not_authorized_for_synthetic_flow":
+            raise NotExecuted("resting maker is not currently settleable; matching command not executed")
+        fills = list(preview.fills)
+        try:
+            if taker_order is None:
+                fills = [f for f in fills if not await self.is_contract_ladder(session, f.maker_user_id, market.id)]
+                await self.preflight_ladder_user_fills(session, market, fills)
+            else:
+                await self.preflight_ladder_user_fills(session, market, fills, taker_order=taker_order)
+        except ContractValidationError as exc:
+            raise NotExecuted(f"resting maker is not currently settleable: {exc}; matching command not executed") from exc
+
     async def _consume_fast_broadcast(self, _symbol: str, payload: dict) -> None:
         await self._deferred_fast_broadcast_contract(**payload)
 
@@ -280,6 +486,14 @@ class ContractService:
         return normalized if abs(normalized - raw) <= tolerance else raw
 
     def _normalize_payload(self, market: Market, payload) -> None:
+        if getattr(payload, "reduce_only", False) or getattr(payload, "position_action", None) == POSITION_ACTION_CLOSE:
+            payload.position_action = POSITION_ACTION_CLOSE
+            payload.reduce_only = True
+        # Integer markets reject fractions before normalization; never change the requested amount.
+        if market.qty_precision == 0 and to_decimal(payload.quantity) != to_decimal(payload.quantity).to_integral_value():
+            raise ContractValidationError("quantity must be an integer for this market")
+        if market.price_precision == 0 and payload.price is not None and to_decimal(payload.price) != to_decimal(payload.price).to_integral_value():
+            raise ContractValidationError("price must be an integer for this market")
         payload.quantity = self._normalize_qty(market, payload.quantity)
         if payload.price is not None:
             payload.price = self._normalize_price(market, payload.price)
@@ -377,6 +591,7 @@ class ContractService:
         return dict(self._fast_metrics)
 
     def _fast_writer_ready(self) -> bool:
+        self.runtime.engine.fault.check()
         writer = getattr(self.runtime, "persistence_writer", None)
         if writer is None:
             return False
@@ -391,7 +606,15 @@ class ContractService:
         writer = getattr(self.runtime, "persistence_writer", None)
         if writer is None:
             raise ContractValidationError("persistence writer unavailable")
-        if str(settings.core_mode or "legacy").lower() == "unified":
+        from app.services.persistence_contract import facts_durable
+
+        if callable(getattr(writer, "is_capturing", None)) and writer.is_capturing():
+            writer.enqueue(task)
+            return
+        result = task.get("engine_result") or {}
+        ephemeral = callable(getattr(writer, "is_ephemeral_quote_task", None)) and writer.is_ephemeral_quote_task(task)
+        if ((str(settings.core_mode or "legacy").lower() == "unified" and not ephemeral)
+                or (facts_durable() and bool(result.get("fills")))):
             await writer.enqueue_durable(task)
             return
         if writer.enqueue(task):
@@ -470,6 +693,7 @@ class ContractService:
             "side": order.side,
             "position_action": order.position_action,
             "reduce_only": bool(order.reduce_only),
+            "reserved_margin": str(order.reserved_margin) if order.reserved_margin is not None else None,
             "leverage": decimal_to_str(to_decimal(order.leverage)) if order.leverage is not None else None,
             "type": order.type,
             "tif": order.tif,
@@ -657,9 +881,8 @@ class ContractService:
                     )
                 )
                 existing.add(str(snap["order_id"]))
-        self.runtime.engine.clear_market(market.symbol)
-        for book_order in book_orders:
-            self.runtime.engine.load_resting_order(market.symbol, book_order)
+        recovery = self.runtime.engine.rebuild_market(market.symbol, book_orders)
+        self._last_book_recovery = {"symbol": market.symbol, **recovery}
         self.runtime.orderbook_snapshot_unlocked(market.symbol, 50)
         return self.runtime.record_orderbook_reconcile(
             market.symbol,
@@ -671,9 +894,15 @@ class ContractService:
         market_id = int(market.id)
         market_symbol = str(market.symbol)
         try:
+            transaction = session.sync_session.get_transaction()
             await session.commit()
+            chart_batch = session.info.pop("contract_chart_batch", None)
+            if chart_batch is not None and chart_batch[0] is transaction:
+                for chart_trade in chart_batch[1]:
+                    self.runtime.market_data.ingest_trade(**chart_trade)
             self.runtime.publish_orderbook_snapshot_unlocked(market.symbol)
         except Exception:
+            session.info.pop("contract_chart_batch", None)
             await session.rollback()
             if any(mid == market_id for _uid, mid in self._ladder_bindings):
                 self._ladder_financial_unknown[market_symbol] = reason
@@ -815,13 +1044,19 @@ class ContractService:
             await session.commit()
             return account
 
-    async def get_setting(self, session: AsyncSession, user_id: int, market: Market) -> ContractUserSetting:
+    async def get_setting(self, session: AsyncSession, user_id: int, market: Market, *, persist: bool = True) -> ContractUserSetting | SimpleNamespace:
         setting = await session.scalar(
             select(ContractUserSetting).where(
                 ContractUserSetting.user_id == user_id,
                 ContractUserSetting.market_id == market.id,
             )
         )
+        if not persist:
+            return SimpleNamespace(
+                leverage=setting.leverage if setting is not None else market.default_leverage,
+                margin_mode=setting.margin_mode if setting is not None else MARGIN_MODE_ISOLATED,
+                position_mode=(setting.position_mode if setting is not None else None) or POSITION_MODE_ONE_WAY,
+            )
         if setting is None:
             setting = ContractUserSetting(
                 user_id=user_id,
@@ -936,7 +1171,7 @@ class ContractService:
     async def is_hedge_position_mode(self, session: AsyncSession, user_id: int, market: Market) -> bool:
         if market.product_type != PRODUCT_TYPE_PERP:
             return False
-        setting = await self.get_setting(session, user_id, market)
+        setting = await self.get_setting(session, user_id, market, persist=False)
         return setting.position_mode == POSITION_MODE_HEDGE
 
     async def is_hedge_market_maker(self, session: AsyncSession, user_id: int, market: Market) -> bool:
@@ -1086,6 +1321,11 @@ class ContractService:
         async with self.runtime.market_financial_guard(
             market.symbol, lambda: self.contract_financial_keys(session, market, user.id)
         ):
+            from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
+            await session.refresh(market)
+            # Queries below must observe facts committed while the guard was waiting.
+            self._expire_financial_reads(session)
             if reconcile_book:
                 await self.reconcile_engine_book(session, market)
             existing_order = await self._load_live_client_order(session, user, market, payload.client_order_id)
@@ -1097,6 +1337,8 @@ class ContractService:
                 if not self._live_client_order_matches(existing_order, payload):
                     response["client_order_conflict"] = True
                 return response
+            if market.is_active and market.contract_trading_mode != CONTRACT_TRADING_MODE_PAUSED:
+                await self.prepare_resting_fills(session, market, lambda: self._ordinary_preview(market, payload, user))
             try:
                 reserve = await self.validate_order(session, user, market, payload)
             except ContractValidationError as exc:
@@ -1146,7 +1388,15 @@ class ContractService:
                 created_at=now,
                 sequence_number=sequence_number,
             )
+            order.reserved_margin = reserve.amount
             await self.runtime.clearinghouse.refresh_contract_market(session, market.id)
+            await self._preflight_user_makers(session, market, side=payload.side,
+                quantity=Decimal(order.quantity), price=Decimal(order.price) if order.price is not None else None,
+                margin_guard=True, taker_order=order, stp_context=self._stp_context(user))
+            admission_changes = await self.rebalance_user_orders(session, market, user.id, now=now)
+            if order.status == ORDER_STATUS_CANCELED:
+                await session.commit()
+                return {"order": await self.serialize_order(session, order, market.symbol), "trades": []}
             result = self.runtime.engine.process_order(
                 symbol=market.symbol,
                 order_id=order.order_id,
@@ -1160,6 +1410,7 @@ class ContractService:
                 maker_guard=lambda order_id, maker_user_id: self._contract_maker_margin_ok(
                     maker_user_id, market.id
                 ),
+                **self._stp_context(user),
             )
             try:
                 updated_orders, impacted_users, trade_payloads, total_notional = await self.apply_engine_fills(
@@ -1180,6 +1431,7 @@ class ContractService:
                 else:
                     await self.rebuild_engine_book_from_db(session, market_id, reason="contract_settlement_failed")
                 raise
+            updated_orders.update({o.order_id: o for o in admission_changes})
             order.notional = total_notional
             order.filled_quantity = self._normalize_qty(market, order.filled_quantity)
             order.avg_price = (total_notional / Decimal(order.filled_quantity)) if Decimal(order.filled_quantity) > ZERO else None
@@ -1203,6 +1455,7 @@ class ContractService:
                 created_at=now,
             )
             await self.commit_or_rebuild_engine(session, market, reason="contract_place_commit_failed")
+            await self.runtime.clearinghouse.refresh_contract_market(session, market.id)
 
         for changed_order in updated_orders.values():
             if (int(changed_order.user_id), int(market.id)) in self._ladder_bindings:
@@ -1239,6 +1492,85 @@ class ContractService:
             }
         return response
 
+    @staticmethod
+    def _reserve_row(order, *, price=None, remaining=None):
+        return SimpleNamespace(order_id=str(order.order_id), side=order.side,
+            position_action=order.position_action, reduce_only=bool(order.reduce_only),
+            remaining_quantity=Decimal(order.remaining_quantity if remaining is None else remaining),
+            price=Decimal(price if price is not None else order.price or order.reference_price or ZERO),
+            leverage=Decimal(order.leverage or 1), sequence_number=int(order.sequence_number or 0))
+
+    async def _live_user_orders(self, session, market, user_id):
+        return list((await session.scalars(select(Order).where(
+            Order.user_id == user_id, Order.market_id == market.id, Order.product_type == PRODUCT_TYPE_PERP,
+            Order.status.in_([ORDER_STATUS_NEW, ORDER_STATUS_PARTIALLY_FILLED]), Order.remaining_quantity > ZERO,
+            Order.type == ORDER_TYPE_LIMIT, Order.tif.in_([TIF_GTC, TIF_POST_ONLY])
+        ))).all())
+
+    async def _net_order_reserve(self, session, market, user_id, payload, leverage, *, exclude=None):
+        position = await self.get_position(session, user_id, market, create=False)
+        orders = await self._live_user_orders(session, market, user_id)
+        rows = [self._reserve_row(o) for o in orders if o.order_id != exclude]
+        candidate_qty = Decimal(payload.quantity)
+        candidate_price = Decimal(payload.price or self.mark_price(market))
+        if getattr(payload, "type", None) == ORDER_TYPE_MARKET:
+            fills = self.runtime.engine.ensure_market(market.symbol).preview_bbo_order(
+                side=payload.side, quantity=candidate_qty,
+                limit_price=Decimal("Infinity") if payload.side == SIDE_BUY else ZERO).fills
+            candidate_qty = sum((f.quantity for f in fills), ZERO)
+            candidate_price = max((f.price for f in fills), default=candidate_price)
+        candidate = SimpleNamespace(order_id=exclude or "~candidate", side=payload.side,
+            position_action=payload.position_action, reduce_only=bool(getattr(payload, "reduce_only", False)),
+            remaining_quantity=candidate_qty, price=candidate_price,
+            leverage=leverage, sequence_number=max((r.sequence_number for r in rows), default=0) + 1)
+        rows.append(candidate)
+        reserves = required_reserves(position.side if position else POSITION_SIDE_FLAT,
+            self._position_qty_without_storage_dust(market, position.quantity) if position else ZERO, rows)
+        return reserves[candidate.order_id]
+
+    async def rebalance_user_orders(self, session, market, user_id, *, now=None, mutate_engine=True):
+        """Reprice affected user's leaves; never scan the market book or touch strategy intent."""
+        if await self.is_contract_ladder(session, user_id, market.id):
+            return []
+        if await self.is_hedge_market_maker(session, user_id, market):
+            return []
+        orders = await self._live_user_orders(session, market, user_id)
+        if not orders:
+            return []
+        position = await self.get_position(session, user_id, market, create=False)
+        account = await self.get_account(session, user_id, market.margin_asset or market.quote_asset)
+        before = snapshot_contract_account(account)
+        old = sum((self.reserved_margin_for_fill(o, Decimal(o.remaining_quantity), Decimal(o.price or o.reference_price or 0)) for o in orders), ZERO)
+        account.used_margin = Decimal(account.used_margin) - old
+        await self.refresh_account(session, account)
+        capacity = max(Decimal(account.available_margin), ZERO)
+        reserves = required_reserves(position.side if position else POSITION_SIDE_FLAT,
+            self._position_qty_without_storage_dust(market, position.quantity) if position else ZERO,
+            [self._reserve_row(o) for o in orders], available=capacity)
+        changed = []
+        for order in sorted(orders, key=lambda o: (not (o.position_action == POSITION_ACTION_CLOSE or o.reduce_only), int(o.sequence_number or 0), o.order_id)):
+            reserve = reserves[order.order_id]
+            if reserve is None or reserve > capacity + CONTRACT_EPSILON:
+                order.status = ORDER_STATUS_CANCELED
+                order.reject_reason = "remaining reduce-only capacity exhausted" if reserve is None else "remaining order margin insufficient"
+                order.canceled_at = now or datetime.now(tz=UTC)
+                order.updated_at = order.canceled_at
+                order.version = int(order.version or 0) + 1
+                order.reserved_margin = ZERO
+                if mutate_engine:
+                    self.runtime.engine.cancel_order(market.symbol, order.order_id)
+                self._fast_contract_orders.pop(order.order_id, None)
+                self._fast_unregister_client_id(user_id, market.id, order.client_order_id, order.order_id)
+                changed.append(order)
+            else:
+                order.reserved_margin = reserve
+                capacity -= reserve
+                account.used_margin = Decimal(account.used_margin) + reserve
+        await self.refresh_account(session, account)
+        await add_contract_ledger_entry(session, account, change_type="margin_settle", amount=ZERO,
+            before=before, market_id=market.id, note="contract_remaining_risk_rebalance", created_at=now)
+        return changed
+
     async def validate_order(
         self,
         session: AsyncSession,
@@ -1249,6 +1581,15 @@ class ContractService:
         fast: bool = False,
         quote_context: dict | None = None,
     ) -> ContractReservePlan:
+        restricted = (market.contract_trading_mode == CONTRACT_TRADING_MODE_REDUCE_ONLY or
+            (market.is_listed and market.paper_status in {"REDUCE_ONLY", "DELISTING"}))
+        if restricted and payload.position_action == POSITION_ACTION_OPEN:
+            if not await self.is_hedge_position_mode(session, user.id, market):
+                current = await self.get_position(session, user.id, market, create=False)
+                if current is None or Decimal(current.quantity) <= ZERO or current.side == self.order_position_side(payload.side, POSITION_ACTION_OPEN):
+                    raise ContractValidationError("contract market is reduce-only")
+                payload.position_action = POSITION_ACTION_CLOSE
+                payload.reduce_only = True
         if not market.is_active:
             raise ContractValidationError("market is inactive")
         if market.is_listed:
@@ -1303,7 +1644,7 @@ class ContractService:
             if payload.type != ORDER_TYPE_LIMIT or payload.tif != TIF_GTC or payload.position_action != POSITION_ACTION_OPEN or payload.reduce_only:
                 raise ContractValidationError("internal ladder only supports ordinary open limit GTC")
             return ContractReservePlan(amount=ZERO, leverage=Decimal("1"))
-        setting = None if quote_context else await self.get_setting(session, user.id, market)
+        setting = None if quote_context else await self.get_setting(session, user.id, market, persist=not fast)
         requested_leverage = getattr(payload, "leverage", None)
         default_leverage = (
             quote_context.get("leverage")
@@ -1318,7 +1659,7 @@ class ContractService:
         hedge_mode = (
             bool(quote_context.get("hedge_mode"))
             if quote_context is not None
-            else await self.is_hedge_market_maker(session, user.id, market)
+            else setting.position_mode == POSITION_MODE_HEDGE
         )
 
         if payload.position_action == POSITION_ACTION_CLOSE:
@@ -1351,10 +1692,12 @@ class ContractService:
                 create=False,
                 side=target_side if hedge_mode else None,
             )
-        if not hedge_mode and position is not None and Decimal(position.quantity) > ZERO and position.side != target_side:
-            raise ContractValidationError("one-way mode requires closing the current position before opening the opposite side")
 
         target_notional = await self.target_open_notional(session, market, position, order_notional, fast=fast)
+        if not hedge_mode and position is not None and position.side != target_side:
+            current_qty = self._position_qty_without_storage_dust(market, position.quantity)
+            prospective = max(ZERO, quantity - current_qty)
+            target_notional = prospective * (Decimal(payload.price) if payload.price is not None else self.mark_price(market))
         if quote_context is not None and quote_context.get("risk_tiers"):
             tiers = list(quote_context["risk_tiers"])
             risk_tier = tiers[-1]
@@ -1375,6 +1718,8 @@ class ContractService:
 
         margin_asset = market.margin_asset or market.quote_asset
         reserve = self.reserve_for_payload(market, payload, leverage)
+        if not hedge_mode and not fast:
+            reserve.amount = await self._net_order_reserve(session, market, user.id, payload, leverage)
         if fast:
             available_margin = self.runtime.clearinghouse.contract_available(user.id, margin_asset)
             if available_margin < reserve.amount:
@@ -1556,11 +1901,8 @@ class ContractService:
             snap = self._fast_contract_orders.get(maker_id)
             if snap is not None and await self.is_contract_ladder(session, int(snap["user_id"]), market.id):
                 maker_orders[maker_id] = await self.ensure_ladder_order_anchor(session, market, snap)
-        if len(maker_orders) < len(maker_order_ids):
-            writer = getattr(self.runtime, "persistence_writer", None)
-            if writer is not None:
-                await writer.flush(timeout=2.0)
-            maker_orders = await self.load_orders_map(session, maker_order_ids)
+        # Internal LADDER anchors were materialized above in this transaction.
+        # Waiting on a separate SQL writer here would wait on our own write lock.
         if len(maker_orders) < len(maker_order_ids):
             missing = sorted(maker_order_ids - set(maker_orders))
             raise ContractValidationError(f"maker orders not persisted: {missing}")
@@ -1593,20 +1935,24 @@ class ContractService:
             impacted_users.add(maker_order.user_id)
             updated_orders[maker_order.order_id] = maker_order
             if ingest:
-                self.runtime.market_data.ingest_trade(
-                    market.symbol,
-                    price=Decimal(trade.price),
-                    quantity=Decimal(trade.quantity),
-                    side=taker_order.side,
-                    ts=executed_at,
-                    trade_id=trade.trade_id,
-                    price_scale=market.price_precision,
-                    qty_scale=market.qty_precision,
-                    source=trade.source,
-                )
+                chart_trade = dict(symbol=market.symbol, price=Decimal(trade.price), quantity=Decimal(trade.quantity),
+                    side=taker_order.side, ts=executed_at, trade_id=trade.trade_id,
+                    price_scale=market.price_precision, qty_scale=market.qty_precision, source=trade.source)
+                if platform_durable_contract():
+                    transaction = session.sync_session.get_transaction()
+                    previous = session.info.get("contract_chart_batch")
+                    if previous is None or previous[0] is not transaction:
+                        session.info["contract_chart_batch"] = (transaction, [])
+                    session.info["contract_chart_batch"][1].append(chart_trade)
+                else:
+                    self.runtime.market_data.ingest_trade(**chart_trade)
             await self.runtime.market_data.persist_kline(session, market.id, market.symbol, "1m")
             await self.runtime.market_data.persist_kline(session, market.id, market.symbol, "5m")
             trade_payloads.append(await self.serialize_trade(trade, market.symbol, market))
+        if result.fills:
+            for uid in impacted_users:
+                for changed in await self.rebalance_user_orders(session, market, uid, now=executed_at, mutate_engine=ingest):
+                    updated_orders[changed.order_id] = changed
         return updated_orders, impacted_users, trade_payloads, total_notional
 
     async def get_fee_rate(self, session: AsyncSession, user_id: int, market_id: int, *, taker: bool, market: Market) -> Decimal:
@@ -1703,8 +2049,8 @@ class ContractService:
             quote_amount=quote_amount,
             taker_order_id=taker_order.order_id,
             maker_order_id=maker_order.order_id,
-            taker_position_action=taker_order.position_action,
-            maker_position_action=maker_order.position_action,
+            taker_position_action=getattr(taker_order, "_last_fill_action", taker_order.position_action),
+            maker_position_action=getattr(maker_order, "_last_fill_action", maker_order.position_action),
             taker_realized_pnl=taker_realized,
             maker_realized_pnl=maker_realized,
             taker_user_id=taker_user.id,
@@ -1795,52 +2141,40 @@ class ContractService:
         if position is None:
             raise ContractValidationError("no matching position to close")
         leverage = Decimal(order.leverage or market.default_leverage)
+        try:
+            split = split_fill(side=order.side, action=order.position_action, reduce_only=bool(order.reduce_only),
+                hedge=hedge_mode, position_side=position.side,
+                position_qty=self._position_qty_without_storage_dust(market, position.quantity), quantity=quantity)
+        except ValueError as exc:
+            raise ContractValidationError(str(exc)) from exc
+        order._last_fill_action = split.action
         realized = ZERO
+        released_margin = ZERO
         position_deleted = False
-        if order.position_action == POSITION_ACTION_OPEN:
-            before = snapshot_contract_account(account)
-            reserved = self.reserved_margin_for_fill(order, quantity, price)
-            added_margin = price * quantity / leverage
-            account.used_margin = Decimal(account.used_margin) + added_margin - reserved
-            await self.apply_open_position(position, market, order, quantity, price, added_margin, leverage)
+        before = snapshot_contract_account(account)
+        reserved = self.reserved_margin_for_fill(order, quantity, price)
+        if order.reserved_margin is not None:
+            order.reserved_margin = max(ZERO, Decimal(order.reserved_margin) - reserved)
+        if split.close:
+            realized, released_margin = await self.apply_close_position(position, market, order, split.close, price)
+        added_margin = price * split.opened / leverage
+        if split.opened:
+            await self.apply_open_position(position, market, order, split.opened, price, added_margin, leverage)
+        account.wallet_balance = Decimal(account.wallet_balance) + realized
+        account.used_margin = Decimal(account.used_margin) - released_margin + added_margin - reserved
+        account.realized_pnl = Decimal(account.realized_pnl) + realized
+        if hedge_mode and Decimal(position.quantity) <= ZERO:
+            await session.delete(position)
+            position_deleted = True
+        if not position_deleted:
             await self.refresh_position(position, market, session)
-            await self.refresh_account(session, account)
-            await add_contract_ledger_entry(
-                session,
-                account,
-                change_type="margin_settle",
-                amount=ZERO,
-                before=before,
-                market_id=market.id,
-                related_order_id=order.order_id,
-                related_trade_id=related_trade_id,
-                note="contract_open_margin_settle",
-                created_at=executed_at,
-            )
-        else:
-            before = snapshot_contract_account(account)
-            realized, released_margin = await self.apply_close_position(position, market, order, quantity, price)
-            account.wallet_balance = Decimal(account.wallet_balance) + realized
-            account.used_margin = Decimal(account.used_margin) - released_margin
-            account.realized_pnl = Decimal(account.realized_pnl) + realized
-            if hedge_mode and Decimal(position.quantity) <= ZERO:
-                await session.delete(position)
-                position_deleted = True
-            if not position_deleted:
-                await self.refresh_position(position, market, session)
-            await self.refresh_account(session, account)
-            await add_contract_ledger_entry(
-                session,
-                account,
-                change_type="position_close",
-                amount=realized,
-                before=before,
-                market_id=market.id,
-                related_order_id=order.order_id,
-                related_trade_id=related_trade_id,
-                note="contract_position_close",
-                created_at=executed_at,
-            )
+        await self.refresh_account(session, account)
+        await add_contract_ledger_entry(
+            session, account, change_type="position_close" if split.close else "margin_settle",
+            amount=realized, before=before, market_id=market.id,
+            related_order_id=order.order_id, related_trade_id=related_trade_id,
+            note=f"contract_{split.action}_settle", created_at=executed_at,
+        )
 
         before_fee = snapshot_contract_account(account)
         account.wallet_balance = Decimal(account.wallet_balance) - fee
@@ -1865,6 +2199,10 @@ class ContractService:
 
     @staticmethod
     def reserved_margin_for_fill(order: Order, quantity: Decimal, price: Decimal) -> Decimal:
+        stored = getattr(order, "reserved_margin", None)
+        if stored is not None:
+            remaining = Decimal(order.remaining_quantity)
+            return Decimal(stored) * min(quantity, remaining) / remaining if remaining > ZERO else ZERO
         if order.position_action != POSITION_ACTION_OPEN:
             return ZERO
         reserve_price = Decimal(order.price) if order.type == ORDER_TYPE_LIMIT and order.price is not None else price
@@ -2058,6 +2396,8 @@ class ContractService:
         account = await self.get_account(session, order.user_id, market.margin_asset or market.quote_asset)
         before = snapshot_contract_account(account)
         account.used_margin = Decimal(account.used_margin) - min(max(release, ZERO), Decimal(account.used_margin))
+        if order.reserved_margin is not None:
+            order.reserved_margin = ZERO
         account.updated_at = now
         await self.refresh_account(session, account)
         await add_contract_ledger_entry(
@@ -2073,6 +2413,8 @@ class ContractService:
         )
 
     async def cancel_order(self, session: AsyncSession, user: User, order_id: str, *, admin_override: bool = False) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         row = await session.execute(
             select(Order, Market).join(Market, Market.id == Order.market_id).where(Order.order_id == order_id)
         )
@@ -2089,6 +2431,12 @@ class ContractService:
         async with self.runtime.market_financial_guard(
             market.symbol, lambda: self.contract_financial_keys(session, market, order.user_id)
         ):
+            # The initial read preceded the market lock. Refresh after admission:
+            # a fill/cancel may have completed while this request was waiting.
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
+            await session.refresh(order)
+            if order.status not in {ORDER_STATUS_NEW, ORDER_STATUS_PARTIALLY_FILLED}:
+                raise ContractValidationError("order is not cancelable")
             side_name, _, changes = self.runtime.engine.cancel_order(market.symbol, order.order_id)
             now = datetime.now(tz=UTC)
             if order.position_action == POSITION_ACTION_OPEN:
@@ -2112,6 +2460,8 @@ class ContractService:
             order.canceled_at = now
             order.updated_at = now
             order.version = int(order.version or 0) + 1
+            order.reserved_margin = ZERO
+            await self.rebalance_user_orders(session, market, order.user_id, now=now)
             await self.commit_or_rebuild_engine(session, market, reason="contract_cancel_commit_failed")
         changed_bids = changes if side_name == SIDE_BUY else []
         changed_asks = changes if side_name == SIDE_SELL else []
@@ -2137,6 +2487,27 @@ class ContractService:
         fast: bool = False,
         client_order_id: str | None = None,
     ) -> None:
+        row = None if fast else await session.scalar(select(Order).where(Order.order_id == related_order_id))
+        if row is not None and (row.position_action == POSITION_ACTION_CLOSE or row.reduce_only):
+            return
+        if row is not None and row.reserved_margin is not None:
+            desired = await self._net_order_reserve(session, market, user_id,
+                SimpleNamespace(side=row.side, position_action=row.position_action, reduce_only=row.reduce_only,
+                    quantity=new_remaining, price=new_price), leverage, exclude=row.order_id)
+            old_reserve = Decimal(row.reserved_margin)
+            account = await self.get_account(session, user_id, market.margin_asset or market.quote_asset)
+            await self.refresh_account(session, account)
+            delta = desired - old_reserve
+            if delta > Decimal(account.available_margin) + CONTRACT_EPSILON:
+                raise ContractValidationError("insufficient available margin")
+            before = snapshot_contract_account(account)
+            account.used_margin = Decimal(account.used_margin) + delta
+            row.reserved_margin = desired
+            await self.refresh_account(session, account)
+            await add_contract_ledger_entry(session, account, change_type="margin_settle", amount=ZERO,
+                before=before, market_id=market.id, related_order_id=row.order_id,
+                note="contract_amend_margin_reserve_adjust", created_at=now)
+            return
         if leverage <= ZERO:
             return
         old_reserve = old_price * old_remaining / leverage
@@ -2367,6 +2738,11 @@ class ContractService:
         """
         if not market.is_active:
             raise ContractValidationError("market is inactive")
+        if market.is_listed:
+            if market.paper_status not in {"TRADING", "REDUCE_ONLY", "DELISTING"}:
+                raise ContractValidationError("paper market does not allow amendments")
+            if market.paper_status in {"REDUCE_ONLY", "DELISTING"} and order.position_action != POSITION_ACTION_CLOSE:
+                raise ContractValidationError("paper market is reduce-only")
         trading_mode = market.contract_trading_mode or "normal"
         if trading_mode == CONTRACT_TRADING_MODE_PAUSED:
             raise ContractValidationError("contract market is paused")
@@ -2392,8 +2768,8 @@ class ContractService:
         if new_remaining <= ZERO:
             raise ContractValidationError("quantity cannot be below filled quantity")
 
-        setting = await self.get_setting(session, user.id, market)
-        leverage = Decimal(setting.leverage)
+        setting = await self.get_setting(session, user.id, market, persist=not fast)
+        leverage = Decimal(order.leverage or setting.leverage)
         if leverage > Decimal(market.max_leverage):
             raise ContractValidationError(f"leverage exceeds max_leverage {market.max_leverage}")
 
@@ -2424,14 +2800,14 @@ class ContractService:
                 market,
                 SimpleNamespace(side=order.side, position_action=POSITION_ACTION_CLOSE, quantity=new_remaining),
                 target_side=self.order_position_side(order.side, POSITION_ACTION_CLOSE),
-                hedge_mode=await self.is_hedge_market_maker(session, user.id, market),
+                hedge_mode=setting.position_mode == POSITION_MODE_HEDGE,
                 fast=fast,
                 exclude_order_id=str(getattr(order, "order_id", "") or "") or None,
             )
             return new_price, new_quantity, new_remaining, ZERO
 
         target_side = self.order_position_side(order.side, POSITION_ACTION_OPEN)
-        hedge_mode = await self.is_hedge_market_maker(session, user.id, market)
+        hedge_mode = setting.position_mode == POSITION_MODE_HEDGE
         if fast:
             position_state = self.runtime.clearinghouse.position_snapshot(user.id, market.id)
             position = None
@@ -2450,8 +2826,6 @@ class ContractService:
                 create=False,
                 side=target_side if hedge_mode else None,
             )
-        if not hedge_mode and position is not None and Decimal(position.quantity) > ZERO and position.side != target_side:
-            raise ContractValidationError("one-way mode requires closing the current position before opening the opposite side")
         target_notional = await self.target_open_notional(session, market, position, order_notional, fast=fast)
         risk_tier = await self.risk_tier_for_notional(session, market, target_notional)
         tier_max_leverage = min(Decimal(market.max_leverage), Decimal(risk_tier.max_leverage))
@@ -2464,6 +2838,11 @@ class ContractService:
         old_price = self._normalize_price(market, order.price) or ZERO
         old_reserve = self.reserved_margin_for_fill(order, old_remaining, old_price)
         new_reserve = new_price * new_remaining / leverage
+        if not fast and not hedge_mode:
+            new_reserve = await self._net_order_reserve(session, market, user.id,
+                SimpleNamespace(side=order.side, position_action=order.position_action, reduce_only=order.reduce_only,
+                    quantity=new_remaining, price=new_price), leverage, exclude=order.order_id)
+
         delta = new_reserve - old_reserve
         margin_asset = market.margin_asset or market.quote_asset
         if delta > ZERO:
@@ -2492,6 +2871,8 @@ class ContractService:
         *,
         admin_override: bool = False,
     ) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         record = await session.execute(
             select(Order, Market).join(Market, Market.id == Order.market_id).where(Order.order_id == order_id)
         )
@@ -2512,11 +2893,14 @@ class ContractService:
         async with self.runtime.market_financial_guard(
             market.symbol, lambda: self.contract_financial_keys(session, market, order.user_id)
         ):
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
+            await session.refresh(market)
+            self._expire_financial_reads(session)
             locked = await session.execute(
                 select(Order, Market)
                 .join(Market, Market.id == Order.market_id)
                 .where(Order.order_id == order_id)
-                .with_for_update()
+                .with_for_update().execution_options(populate_existing=True)
             )
             locked_first = locked.first()
             if locked_first is None:
@@ -2540,6 +2924,7 @@ class ContractService:
             if new_price == current_price and new_quantity == current_quantity:
                 return {"order": await self.serialize_order(session, order, market.symbol), "kept_priority": True}
 
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
             leverage = Decimal(order.leverage or market.default_leverage)
             await self._adjust_contract_reserve(
                 session,
@@ -2568,6 +2953,12 @@ class ContractService:
             changed_asks: list[list[str]] = []
             kept_priority = False
             if crossing_book:
+                projected_order = SimpleNamespace(**{name: getattr(order, name) for name in (
+                    "order_id", "user_id", "market_id", "product_type", "status", "position_action",
+                    "reduce_only", "side", "leverage", "type", "reserved_margin")},
+                    remaining_quantity=new_remaining, price=new_price)
+                await self._preflight_user_makers(session, market, side=order.side,
+                    quantity=new_remaining, price=new_price, stp_context=self._stp_context(user), taker_order=projected_order)
                 sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
                     CrossingAmendCommand(
                         order_id=order.order_id,
@@ -2627,6 +3018,8 @@ class ContractService:
                 changed_bids = amend.changed_bids
                 changed_asks = amend.changed_asks
                 kept_priority = bool(amend.kept_priority)
+                for changed in await self.rebalance_user_orders(session, market, order.user_id, now=now):
+                    updated_orders[changed.order_id] = changed
                 await self.commit_or_rebuild_engine(session, market, reason="contract_amend_commit_failed")
 
         self._fast_metrics["slow_amend"] += 1
@@ -2654,6 +3047,8 @@ class ContractService:
         }
 
     async def amend_order_batch(self, session: AsyncSession, user: User, payload) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         order_ids = [item.order_id for item in payload.orders]
         if len(set(order_ids)) != len(order_ids):
             raise ContractValidationError("duplicate order_id in batch")
@@ -2663,11 +3058,16 @@ class ContractService:
         async with self.runtime.market_financial_guard(
             symbol, lambda: self.contract_financial_keys(session, batch_market, user.id)
         ):
+            if not order_ids:
+                raise ContractValidationError("orders is required")
+            await acquire_sqlite_write_admission(session, existing_order_id=order_ids[0])
+            await session.refresh(batch_market)
+            self._expire_financial_reads(session)
             rows = await session.execute(
                 select(Order, Market)
                 .join(Market, Market.id == Order.market_id)
                 .where(Order.order_id.in_(order_ids))
-                .with_for_update()
+                .with_for_update().execution_options(populate_existing=True)
             )
             loaded = rows.all()
             if len(loaded) != len(order_ids):
@@ -2768,6 +3168,7 @@ class ContractService:
             changed_bids: list[list[str]] = []
             changed_asks: list[list[str]] = []
             if batch_items:
+                await acquire_sqlite_write_admission(session, existing_order_id=batch_items[0].order_id)
                 for entry in prepared:
                     if not entry["changed"]:
                         continue
@@ -2805,6 +3206,7 @@ class ContractService:
                     order.updated_at = now
                     order.status = ORDER_STATUS_PARTIALLY_FILLED if entry["filled_quantity"] > ZERO else ORDER_STATUS_NEW
                     order.version = int(order.version or 0) + 1
+                await self.rebalance_user_orders(session, market, user.id, now=now)
                 await self.commit_or_rebuild_engine(session, market, reason="contract_batch_amend_commit_failed")
                 changed_bids = sequencer_result.changed_bids
                 changed_asks = sequencer_result.changed_asks
@@ -2940,6 +3342,7 @@ class ContractService:
             amount=Decimal(str(plan["reserve"]["amount"])),
             leverage=to_decimal(plan["reserve"].get("leverage")) if plan["reserve"].get("leverage") is not None else market.default_leverage,
         )
+        order.reserved_margin = reserve.amount
         account = await self.get_account(session, user.id, market.margin_asset or market.quote_asset)
         if reserve.amount > ZERO:
             await self._ensure_robot_quote_replay_margin(
@@ -3211,59 +3614,41 @@ class ContractService:
         leverage = Decimal(snap.get("leverage") or market.default_leverage)
         position = self.runtime.clearinghouse.position_snapshot(user_id, int(market.id))
         old_unrealized = position.unrealized() if position is not None else ZERO
+        if position is None:
+            position = PositionState(user_id=user_id, market_id=int(market.id), side=POSITION_SIDE_FLAT,
+                quantity=ZERO, entry_price=ZERO, isolated_margin=ZERO, maintenance_margin=ZERO, leverage=leverage)
+        try:
+            split = split_fill(side=snap["side"], action=snap.get("position_action"),
+                reduce_only=bool(snap.get("reduce_only")),
+                hedge=await self.is_hedge_position_mode(session, user_id, market),
+                position_side=position.side,
+                position_qty=self._position_qty_without_storage_dust(market, position.quantity), quantity=quantity)
+        except ValueError as exc:
+            raise ContractValidationError(str(exc)) from exc
+        snap["_last_fill_action"] = split.action
         realized = ZERO
-        if snap.get("position_action") == POSITION_ACTION_OPEN:
-            target_side = self.order_position_side(snap["side"], POSITION_ACTION_OPEN)
-            if position is None:
-                position = PositionState(
-                    user_id=user_id,
-                    market_id=int(market.id),
-                    side=POSITION_SIDE_FLAT,
-                    quantity=ZERO,
-                    entry_price=ZERO,
-                    isolated_margin=ZERO,
-                    maintenance_margin=ZERO,
-                    leverage=leverage,
-                )
-            if Decimal(position.quantity) > ZERO and position.side not in {POSITION_SIDE_FLAT, target_side}:
-                raise ContractValidationError("opposite position cannot be opened in one-way mode")
-            reserved = self._fast_reserved_margin_for_snap(snap, quantity, price, leverage)
-            added_margin = price * quantity / leverage
-            if Decimal(position.quantity) <= ZERO or position.side == POSITION_SIDE_FLAT:
-                position.side = target_side
-                position.quantity = quantity
-                position.entry_price = price
-                position.isolated_margin = added_margin
-            else:
-                old_qty = Decimal(position.quantity)
-                new_qty = old_qty + quantity
-                position.entry_price = ((Decimal(position.entry_price) * old_qty) + (price * quantity)) / new_qty
-                position.quantity = new_qty
-                position.isolated_margin = Decimal(position.isolated_margin) + added_margin
-            position.leverage = leverage
-            account.used_margin = Decimal(account.used_margin) + added_margin - reserved
-        else:
-            target_side = self.order_position_side(snap["side"], POSITION_ACTION_CLOSE)
-            old_qty = self._position_qty_without_storage_dust(market, position.quantity) if position is not None else ZERO
-            if position is None or position.side != target_side or old_qty < quantity:
-                raise ContractValidationError("close quantity exceeds current position")
-            close_ratio = quantity / old_qty
-            if position.side == POSITION_SIDE_LONG:
-                realized = (price - Decimal(position.entry_price)) * quantity
-            else:
-                realized = (Decimal(position.entry_price) - price) * quantity
-            released_margin = Decimal(position.isolated_margin) * close_ratio
-            position.quantity = old_qty - quantity
+        released_margin = ZERO
+        if split.close:
+            old_qty = self._position_qty_without_storage_dust(market, position.quantity)
+            realized = (price - Decimal(position.entry_price)) * split.close * (1 if position.side == POSITION_SIDE_LONG else -1)
+            released_margin = Decimal(position.isolated_margin) * split.close / old_qty
+            position.quantity = old_qty - split.close
             position.isolated_margin = Decimal(position.isolated_margin) - released_margin
             position.realized_pnl = Decimal(position.realized_pnl) + realized
-            if Decimal(position.quantity) <= CONTRACT_EPSILON:
-                position.side = POSITION_SIDE_FLAT
-                position.quantity = ZERO
-                position.entry_price = ZERO
-                position.isolated_margin = ZERO
-            account.wallet_balance = Decimal(account.wallet_balance) + realized
-            account.used_margin = Decimal(account.used_margin) - released_margin
-            account.realized_pnl = Decimal(account.realized_pnl) + realized
+            if position.quantity <= CONTRACT_EPSILON:
+                position.side, position.quantity, position.entry_price, position.isolated_margin = POSITION_SIDE_FLAT, ZERO, ZERO, ZERO
+        added_margin = price * split.opened / leverage
+        if split.opened:
+            old_qty = Decimal(position.quantity)
+            position.entry_price = (Decimal(position.entry_price)*old_qty + price*split.opened)/(old_qty+split.opened)
+            position.quantity = old_qty + split.opened
+            position.side = self.order_position_side(snap["side"], POSITION_ACTION_OPEN)
+            position.isolated_margin = Decimal(position.isolated_margin) + added_margin
+            position.leverage = leverage
+        reserved = self._fast_reserved_margin_for_snap(snap, quantity, price, leverage)
+        account.wallet_balance = Decimal(account.wallet_balance) + realized
+        account.used_margin = Decimal(account.used_margin) + added_margin - released_margin - reserved
+        account.realized_pnl = Decimal(account.realized_pnl) + realized
 
         account.wallet_balance = Decimal(account.wallet_balance) - fee
         account.total_fees = Decimal(account.total_fees) + fee
@@ -3276,7 +3661,6 @@ class ContractService:
             notional = mark * Decimal(position.quantity)
             risk_tier = await self.risk_tier_for_notional(session, market, notional)
             position.maintenance_margin = self.maintenance_margin_for_notional(notional, risk_tier)
-            position.leverage = leverage
             new_unrealized = position.unrealized(mark)
         account.unrealized_pnl = Decimal(account.unrealized_pnl) + (new_unrealized - old_unrealized)
         self.runtime.clearinghouse.upsert_position(position)
@@ -3367,8 +3751,8 @@ class ContractService:
                     "quantity": decimal_to_str(self._normalize_qty(market, fill.quantity)),
                     "quote_amount": decimal_to_str(quantize_scale(quote_amount, 8)),
                     "taker_side": taker_snap["side"],
-                    "taker_position_action": taker_snap.get("position_action"),
-                    "maker_position_action": maker.get("position_action"),
+                    "taker_position_action": taker_snap.get("_last_fill_action", taker_snap.get("position_action")),
+                    "maker_position_action": maker.get("_last_fill_action", maker.get("position_action")),
                     "taker_realized_pnl": decimal_to_str(quantize_scale(taker_realized, 8)),
                     "maker_realized_pnl": decimal_to_str(quantize_scale(maker_realized, 8)),
                     "maker_fee": decimal_to_str(quantize_scale(maker_fee, 8)),
@@ -3487,6 +3871,7 @@ class ContractService:
                 market.symbol,
                 {"channel": "trades", "type": "update", "symbol": market.symbol, "items": trade_payloads},
             )
+            await self.runtime.market_data.broadcast_klines(self.runtime.ws, market.symbol)
             for interval in ["1s", "5s", "15s", "1m", "5m", "15m"]:
                 items = self.runtime.market_data.get_public_klines(market.symbol, interval, 1)
                 if items:
@@ -3622,6 +4007,12 @@ class ContractService:
             ).limit(1)) is not None
         if ladder_market:
             return None
+        if platform_durable_contract():
+            # All platform account-bearing executions share market + UID/asset
+            # locks and one committed SQL authority. Legacy memory clearing uses
+            # a disjoint global lock; mixing the two can invalidate a net reserve
+            # while waiting. LADDER's ephemeral adapter was declined above.
+            return await self.place_order(session, user, payload, now=now, broadcast=broadcast)
         if broadcast:
             try:
                 synthetic = await execute_synthetic_flow(
@@ -3716,7 +4107,7 @@ class ContractService:
                 effective_command_sequence = None
             else:
                 raise ContractValidationError("stale place priority sequence")
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             if reserve.amount > ZERO:
                 try:
                     self.runtime.clearinghouse.reserve_contract_margin(
@@ -3724,22 +4115,27 @@ class ContractService:
                     )
                 except ValueError as exc:
                     raise ContractValidationError(str(exc)) from exc
-            sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
-                NewOrderCommand(
-                    order_id=order_id,
-                    user_id=user.id,
-                    side=payload.side,
-                    quantity=Decimal(payload.quantity),
-                    created_at=now,
-                    limit_price=Decimal(payload.price) if payload.price is not None else None,
-                    can_rest=payload.type == ORDER_TYPE_LIMIT and payload.tif in {TIF_GTC, TIF_POST_ONLY},
-                    maker_guard=lambda _order_id, maker_user_id: self._contract_maker_margin_ok(
-                        maker_user_id, int(market.id)
-                    ),
-                    sequence_number=effective_command_sequence,
-                    **self._stp_context(user),
+            try:
+                sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
+                    NewOrderCommand(
+                        order_id=order_id,
+                        user_id=user.id,
+                        side=payload.side,
+                        quantity=Decimal(payload.quantity),
+                        created_at=now,
+                        limit_price=Decimal(payload.price) if payload.price is not None else None,
+                        can_rest=payload.type == ORDER_TYPE_LIMIT and payload.tif in {TIF_GTC, TIF_POST_ONLY},
+                        maker_guard=lambda _order_id, maker_user_id: self._contract_maker_margin_ok(
+                            maker_user_id, int(market.id)
+                        ),
+                        sequence_number=effective_command_sequence,
+                        **self._stp_context(user),
+                    )
                 )
-            )
+            except NotExecuted:
+                if reserve.amount > ZERO:
+                    self.runtime.clearinghouse.release_contract_margin(user.id, market.margin_asset or market.quote_asset, reserve.amount)
+                raise
             result = sequencer_result.engine_result
             if result is None:
                 raise ContractValidationError("sequencer did not return engine result")
@@ -3883,6 +4279,8 @@ class ContractService:
                 order_id,
             )
             return None
+        if platform_durable_contract() or (snap is not None and snap.get("reserved_margin") is not None):
+            return await self.cancel_order(session, user, order_id)
         if not self._fast_writer_ready():
             logging.getLogger("contract_service").warning(
                 "fast cancel skipped: persistence writer not ready user_id=%s order_id=%s",
@@ -3892,7 +4290,7 @@ class ContractService:
             return None
         market = await self.get_market(session, snap["symbol"])
         now = now or datetime.now(tz=UTC)
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
                 CancelOrderCommand(order_id=order_id, sequence_number=command_sequence)
             )
@@ -3996,6 +4394,8 @@ class ContractService:
                 order_id,
             )
             raise ContractValidationError("order not found on fast book")
+        if platform_durable_contract() or (snap is not None and snap.get("reserved_margin") is not None):
+            return await self.amend_order(session, user, order_id, payload)
         market = market_override or await self.get_market(session, snap["symbol"])
         now = now or datetime.now(tz=UTC)
         new_price = self._normalize_price(market, payload.price if payload.price is not None else snap["price"])
@@ -4055,7 +4455,7 @@ class ContractService:
                 effective_command_sequence = None
             else:
                 raise ContractValidationError("stale amend priority sequence")
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             maker_pre_fill_anchors: list[dict] = []
             reserve_aligned_before_fill = False
             if crossing_book:
@@ -4264,6 +4664,8 @@ class ContractService:
     ) -> dict | None:
         if not payload.orders or not self._fast_writer_ready():
             return None
+        if platform_durable_contract() or any(self._fast_contract_orders.get(item.order_id, {}).get("reserved_margin") is not None for item in payload.orders):
+            return await self.amend_order_batch(session, user, payload)
         symbol = str(payload.symbol).upper()
         market = market_override or await self.get_market(session, symbol)
         book = bbo_snapshot
@@ -4374,7 +4776,7 @@ class ContractService:
                         "error": str(exc),
                     }
                 )
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             for entry in prepared:
                 if not entry["changed"]:
                     continue
@@ -4662,6 +5064,14 @@ class ContractService:
         }
 
     async def serialize_position(self, position: ContractPosition, market: Market, session: AsyncSession | None = None) -> dict:
+        # Live display calculations must not dirty the session's financial row.
+        # Otherwise a later read can autoflush and retain a writer lock through
+        # WebSocket delivery or the next maintenance market lock.
+        position = SimpleNamespace(**{name: getattr(position, name) for name in (
+            "side", "quantity", "entry_price", "mark_price", "liquidation_price",
+            "leverage", "margin_mode", "isolated_margin", "maintenance_margin",
+            "unrealized_pnl", "realized_pnl", "updated_at",
+        )})
         await self.refresh_position(position, market, session)
         # Display normalization must never turn real positive exposure into zero.
         quantity = self._normalize_qty(market, position.quantity)
@@ -4769,6 +5179,7 @@ class ContractService:
         await self.runtime.ws.broadcast_public("stats", symbol, {"channel": "stats", "type": "update", "symbol": symbol, "data": stats})
         if trade_payloads:
             await self.runtime.ws.broadcast_public("trades", symbol, {"channel": "trades", "type": "update", "symbol": symbol, "items": trade_payloads})
+            await self.runtime.market_data.broadcast_klines(self.runtime.ws, symbol)
         for user_id in impacted_users:
             for order in orders:
                 if order.user_id == user_id:

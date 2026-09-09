@@ -11,6 +11,10 @@ from app.services.order_service import OrderValidationError
 
 
 class SpotBBOAdapter(ContractLadderAdapter):
+    # Spot uses its own funded service and four-argument execution override;
+    # it does not implement LADDER's optional pre-match quote-check protocol.
+    place_checked = None
+
     def invalidate_identity(self, symbol, market_id):
         self.invalidate_metadata(symbol)
 

@@ -1,3 +1,4 @@
+import { BinanceBookReference } from "./BinanceBookReference";
 import { useCenteredBookScroll } from "../../hooks/useCenteredBookScroll";
 import { memo, useRef, useState } from "react";
 import { mergeLevels } from "../../lib/orderbook";
@@ -6,9 +7,21 @@ import { RelativeTime } from "../ui";
 
 const ROW_GRID = "grid-cols-[minmax(9ch,1fr)_minmax(7ch,0.8fr)_minmax(8ch,0.9fr)]";
 
+const fixedFormatters = new Map<number, Intl.NumberFormat>();
+const compactFormatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const fixedFormat = (value: number, digits: number) => {
+  const precision = Math.max(0, Math.min(20, Math.trunc(digits)));
+  let formatter = fixedFormatters.get(precision);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("zh-CN", { minimumFractionDigits: precision, maximumFractionDigits: precision });
+    fixedFormatters.set(precision, formatter);
+  }
+  return formatter.format(value);
+};
+
 const formatBookNumber = (value: number, digits: number, compact: boolean) => {
   if (!compact || Math.abs(value) < 1000) {
-    return value.toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    return fixedFormat(value, digits);
   }
   const units = [
     { divisor: 1_000_000_000, suffix: "B" },
@@ -16,7 +29,7 @@ const formatBookNumber = (value: number, digits: number, compact: boolean) => {
     { divisor: 1_000, suffix: "K" },
   ];
   const unit = units.find((item) => Math.abs(value) >= item.divisor) ?? units[units.length - 1];
-  return `${(value / unit.divisor).toLocaleString("en-US", { maximumFractionDigits: 2 })}${unit.suffix}`;
+  return `${compactFormatter.format(value / unit.divisor)}${unit.suffix}`;
 };
 
 const estimateScale = (levels: Level[]) => {
@@ -59,7 +72,7 @@ const BookRow = memo(function BookRow({
       }`}
       title={`价格 ${priceLabel} · 数量 ${quantityLabel} · 累计 ${cumulativeLabel}`}
     >
-      <span className={`pointer-events-none absolute inset-y-0 right-0 ${side === "buy" ? "bg-emerald-400/8" : "bg-rose-500/8"}`} style={{ width: `${Math.min(100, depthPct)}%` }} />
+      <span className={`pointer-events-none absolute inset-y-0 right-0 ${side === "buy" ? "bg-emerald-400/8" : "bg-rose-500/8"}`} style={{ width: "100%", transformOrigin: "right", transform: `scaleX(${Math.min(100, depthPct) / 100})` }} />
       <span className="num-fixed num-left relative justify-self-start">{priceLabel}</span>
       <span className="num-fixed relative justify-self-end text-slate-200">{quantityLabel}</span>
       <span className="num-fixed relative justify-self-end text-slate-500">{cumulativeLabel}</span>
@@ -96,7 +109,7 @@ function LevelList({
         const depthPct = Math.min(100, (rowNotional / depthScale) * 100);
         return (
           <BookRow
-            key={`${side}-${price}`}
+            key={`${side}-${index}`}
             side={side}
             price={price}
             priceLabel={formatBookNumber(priceNumber, priceDigits, compactNumbers)}
@@ -259,6 +272,7 @@ export function TerminalOrderBook({
         </div>
       </div>
 
+      <BinanceBookReference symbol={symbol} bid={bestBid} ask={bestAsk} />
       <div className="hl-book-sides grid min-h-0 flex-1 grid-cols-2 divide-x divide-white/10">
         {([
           { side: "buy" as const, label: "买盘", levels: visibleBids, cumulative: bidCum, scroll: bidsScroll },

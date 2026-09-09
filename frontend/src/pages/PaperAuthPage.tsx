@@ -4,7 +4,7 @@ import { api } from "../api/client";
 import { useAppStore } from "../store/useAppStore";
 import type { AuthSession } from "../lib/session";
 
-type BrandResponse = { brand: { exchange_name: string; paper_notice: string; primary_color: string } };
+type BrandResponse = { brand: { exchange_name: string; paper_notice: string; primary_color: string; registration_enabled?: boolean } };
 
 export function PaperAuthPage() {
   const location = useLocation();
@@ -60,12 +60,12 @@ export function PaperAuthPage() {
           <h1 className="mt-5 font-display text-4xl leading-tight text-white">轻量模拟交易所</h1>
           <p className="mt-4 max-w-lg text-sm leading-7 text-slate-300">{brand?.paper_notice ?? "所有资产均为模拟资金，不涉及真实资金。"}</p>
           <div className="mt-8 grid gap-3 text-sm text-slate-300 sm:grid-cols-3">
-            <Feature title="现货" text="BTC / ETH 等" />
+            <Feature title="现货" text="模拟币对" />
             <Feature title="永续" text="USDT 本位" />
             <Feature title="账户" text="可随时复位" />
           </div>
           <div className="mt-6 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
-            注册即获得独立的现货与合约测试资金（各 1 亿 USDT）。本页面不连接任何真实交易所，不使用真实密钥。
+            账户具有独立的现货与合约测试资金（各 1 亿 USDT）。本页面不连接任何真实交易所，不使用真实密钥。
           </div>
         </section>
         <form onSubmit={submit} className="auth-card p-6">
@@ -121,7 +121,7 @@ export function PaperAuthPage() {
             )}
           </div>
           {error ? <div className="mt-4 rounded-2xl border border-rose-300/20 bg-rose-400/10 px-3 py-2 text-sm text-rose-200">{error}</div> : null}
-          <button type="submit" disabled={busy} className="mt-6 w-full rounded-2xl bg-cyan-300 px-4 py-3 font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:opacity-50">
+          <button type="submit" disabled={busy || (registerMode && !brand?.registration_enabled)} className="mt-6 w-full rounded-2xl bg-cyan-300 px-4 py-3 font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:opacity-50">
             {busy ? "处理中..." : registerMode ? "创建并进入交易" : "登录"}
           </button>
           <div className="mt-5 text-center text-sm text-slate-400">
@@ -129,11 +129,11 @@ export function PaperAuthPage() {
               <>
                 已有账户？<Link className="ml-1 text-cyan-200 hover:text-white" to="/paper/login">返回登录</Link>
               </>
-            ) : (
+            ) : brand?.registration_enabled ? (
               <>
                 还没有账户？<Link className="ml-1 text-cyan-200 hover:text-white" to="/paper/register">免费创建</Link>
               </>
-            )}
+            ) : <span>请使用管理员提供的账户登录</span>}
           </div>
         </form>
       </div>

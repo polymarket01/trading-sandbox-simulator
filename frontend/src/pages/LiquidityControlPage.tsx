@@ -7,13 +7,23 @@ import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAppStore } from '../store/useAppStore';
 
-type Market = {symbol:string; product_type:string; strategy_key:string; choices:string[]; parameter_editors?:Record<string,string>; source_exchange:string; source_symbol:string; readiness:{ok:boolean; blockers:{code?:string;label:string;detail:string}[]}; ladder?:{state:string}; account_slots:Record<string,number>; maker_accounts:{uid:number;username:string}[]; flow_accounts:{uid:number;username:string}[]};
-const readinessText=(m:Market)=>m.readiness.ok?'通过':m.readiness.blockers.length>0&&m.readiness.blockers.every(b=>b.code==='no_enabled_maker'||b.code==='missing_api_credentials')?'启动时自动初始化':'阻断';
+type Market = {symbol:string; product_type:string; strategy_key:string; choices:string[]; parameter_editors?:Record<string,string>; source_exchange:string; source_symbol:string; readiness:{scope?:string;ok:boolean; blockers:{code?:string;label:string;detail:string}[]}; ladder?:{state:string}; account_slots:Record<string,number>; maker_accounts:{uid:number;username:string}[]; flow_accounts:{uid:number;username:string}[]};
+const readinessText=(m:Market)=>m.readiness.scope==='configuration'?'启动时完整校验':m.readiness.ok?'通过':m.readiness.blockers.length>0&&m.readiness.blockers.every(b=>b.code==='no_enabled_maker'||b.code==='missing_api_credentials')?'启动时自动初始化':'阻断';
 type Flow = {virtual_allow_touch?:boolean;enabled:boolean; mode:string; uid:number|null; interval_min_seconds:number; interval_max_seconds:number; min_quote:string; max_quote:string; turnover_quote_per_min:string; max_level_take_ratio:string; volatility_enabled:boolean; real_ioc_volatility_enabled:boolean; volatility_window_seconds:number; volatility_return_bps:number; volatility_range_bps:number; volatility_max_multiplier:number};
 type FlowDoc = {version:number;config:Flow};
 const defaults:Flow = {enabled:false,mode:'virtual_volume',uid:null,interval_min_seconds:1.5,interval_max_seconds:2.5,min_quote:'100',max_quote:'1000',turnover_quote_per_min:'30000',max_level_take_ratio:'.25',volatility_enabled:true,real_ioc_volatility_enabled:false,volatility_window_seconds:10,volatility_return_bps:5,volatility_range_bps:8,volatility_max_multiplier:100};
 const statusText:Record<string,string>={virtual_print:'虚拟成交已生成',filled:'真实成交已完成',partially_filled:'部分成交',canceled:'IOC 未成交',spread_le_one_tick:'价差不超过 1 tick，跳过',empty_book:'盘口为空，等待',blocked:'执行被阻断，修正后重新保存启动',market_paused:'市场暂停',turnover_limit:'已达每分钟金额上限',waiting_interval:'等待下一轮',below_minimum_or_thin_book:'最优档深度不足或低于最小成交量'};
 type SwitchState={status:string;stage:string;error?:string};
+type Overview={items:Market[];instances?:{symbol:string;running:boolean;status:string}[];switch_supported?:boolean;switches?:Record<string,SwitchState>};
+async function getOverview(key?: string): Promise<Overview> {
+ try { return await api.get<Overview>('/admin/liquidity/overview',key); }
+ catch (error) {
+  if (!(error instanceof Error) || error.message !== 'Not Found') throw error;
+  // Compatibility for a local backend which has not been reloaded yet.
+  const [catalog,instances]=await Promise.all([api.get<Overview>('/admin/liquidity/makers',key),api.get<{items:{symbol:string;running:boolean;status:string}[]}>('/admin/maker-instances',key)]);
+  return {...catalog,instances:instances.items};
+ }
+}
 const inputClass='rounded border border-white/15 bg-slate-950 p-2 text-slate-100 w-full';
 
 function LiquidityEditor({kind, initialSymbol, onBack}:{kind:'maker'|'flow';initialSymbol:string;onBack:()=>void}) {
@@ -32,7 +42,7 @@ function LiquidityEditor({kind, initialSymbol, onBack}:{kind:'maker'|'flow';init
  useEffect(()=>setSourceResult(''),[source,symbol]);
  const market=markets.find(m=>m.symbol===symbol);
  const refresh=useCallback(async()=>{
-  const [m,f]=await Promise.all([api.get<{items:Market[];switch_supported?:boolean;switches?:Record<string,SwitchState>}>('/admin/liquidity/makers',key),api.get<{items:Record<string,FlowDoc>;process:typeof process;metrics:typeof metrics;activity:typeof activity;activity_version?:number}>('/admin/liquidity/flow',key)]);
+  const [m,f]=await Promise.all([getOverview(key),api.get<{items:Record<string,FlowDoc>;process:typeof process;metrics:typeof metrics;activity:typeof activity;activity_version?:number}>('/admin/liquidity/flow',key)]);
   setSwitchSupported(m.switch_supported===true);setSwitchState(m.switches?.[initialSymbol]);
   setMarkets(m.items);setDocs(f.items);setProcess(f.process);setMetrics(f.metrics);setActivity(f.activity||{});setActivitySupported(f.activity_version===1);setSymbol(s=>s||m.items[0]?.symbol||'');
  },[key,initialSymbol]);
@@ -110,14 +120,13 @@ export function LiquidityControlPage({kind}:{kind:'maker'|'flow'}) {
  const [states,setStates]=useState<Record<string,string>>({}),[edit,setEdit]=useState<string | undefined>();
  const [message,setMessage]=useState(''),[busy,setBusy]=useState(''),[filter,setFilter]=useState('');
  const refresh=useCallback(async()=>{
-  const [m,f,i]=await Promise.all([
-   api.get<{items:Market[];switch_supported?:boolean;switches?:Record<string,SwitchState>}>('/admin/liquidity/makers',key),
+  const [m,f]=await Promise.all([
+   getOverview(key),
    api.get<{items:Record<string,FlowDoc>;metrics:Record<string,{status?:string;reason?:string}>}>('/admin/liquidity/flow',key),
-   api.get<{items:{symbol:string;running:boolean;status:string}[]}>('/admin/maker-instances',key),
   ]);
   setMarkets(m.items);setDocs(f.items);
   setStates(Object.fromEntries(m.items.map(row=>{
-   const instance=i.items.find(x=>x.symbol===row.symbol),doc=f.items[row.symbol],metric=f.metrics[row.symbol];
+   const instance=m.instances?.find(x=>x.symbol===row.symbol),doc=f.items[row.symbol],metric=f.metrics[row.symbol];
    const transition=m.switches?.[row.symbol];
    if(kind==='maker'&&transition&&['running','failed','interrupted'].includes(transition.status))return [row.symbol,transition.status==='running'?'切换中':`切换未完成：${transition.error||transition.stage}`];
    return [row.symbol,kind==='maker'?(instance?.running?(row.ladder?.state==='NORMAL'?'运行中':row.ladder?.state==='REST_BACKUP'||instance.status==='REST_BACKUP'?'REST备用':row.ladder?.state==='INDEX_FALLBACK'||instance.status==='INDEX_FALLBACK'?'指数应急铺单':instance.status):'已停止'):

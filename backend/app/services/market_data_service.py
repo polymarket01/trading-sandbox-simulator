@@ -15,6 +15,7 @@ from app.core.time_utils import ensure_utc, to_millis
 from app.models.display_kline import DisplayKline
 from app.models.kline import Kline
 from app.models.trade import Trade
+from app.services.persistence_contract import platform_durable_contract
 
 INTERVAL_SECONDS = {
     "1s": 1,
@@ -48,6 +49,9 @@ class KlinePoint:
     carried_forward: bool = False
     sampled: bool = False
     display_only: bool = False
+    persisted: bool = False
+    first_trade_at: datetime | None = None
+    last_trade_at: datetime | None = None
 
     @property
     def source(self) -> str:
@@ -69,9 +73,9 @@ class MarketDataService:
         self.display_only_recent_trades: dict[str, deque[dict]] = defaultdict(
             lambda: deque(maxlen=200)
         )
-        # Public chart series for financially inert synthetic FLOW.  This is a
-        # separate namespace and table from live_klines/Kline, so it cannot be
-        # consumed as a mark/risk input or masquerade as a durable Trade.
+        # Public chart aggregates consume real fills AND virtual FLOW, like
+        # public TAS. This series/table is never a position, risk or Trade fact;
+        # real-only live_klines remains isolated for those existing consumers.
         self.display_only_klines: dict[str, dict[str, deque[KlinePoint]]] = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=500))
         )
@@ -104,6 +108,8 @@ class MarketDataService:
         self.orderbook_same_seq_diff_count: dict[str, int] = defaultdict(int)
         self.orderbook_seq_rollback_count: dict[str, int] = defaultdict(int)
         self.kline_persist_state: dict[tuple[int, str, str], tuple[datetime, int]] = {}
+        self.minute_dirty: dict[tuple[str, str], set[datetime]] = defaultdict(set)
+        self.closed_minute_ack: dict[tuple[int, str], datetime] = {}
         self.display_kline_persist_state: dict[tuple[int, str, str], tuple[datetime, int]] = {}
 
     def next_seq(self, symbol: str) -> int:
@@ -449,6 +455,10 @@ class MarketDataService:
             ts=ts,
             source=source,
         )
+        # Public charts consume the same real + virtual event stream as TAS.
+        # live_klines remains real-only for risk and accounting consumers.
+        self._ingest_kline_trade(self.display_only_klines, symbol=symbol, price=price,
+            quantity=quantity, ts=ts, source=source)
         if str(settings.persistence_mode).strip().lower() == "sampled":
             self.sample_price(
                 symbol,
@@ -474,6 +484,9 @@ class MarketDataService:
             open_time, close_time = self._bucket(ts, interval)
             series = container[symbol][interval]
             current = series[-1] if series else None
+            late = current is not None and open_time < current.open_time
+            if late:
+                current = next((p for p in reversed(series) if p.open_time == open_time), None)
             if current is None or current.open_time != open_time:
                 if current is not None:
                     current.is_closed = True
@@ -490,19 +503,35 @@ class MarketDataService:
                     source_counts={source: 1},
                     source_volumes={source: quantity},
                     source_quote_volumes={source: quote_amount},
-                    is_closed=False,
+                    is_closed=late, first_trade_at=ts, last_trade_at=ts,
                 )
-                series.append(current)
+                if late:
+                    items = sorted([*series, current], key=lambda p: p.open_time)
+                    series.clear(); series.extend(items)
+                else:
+                    series.append(current)
             else:
                 current.high = max(current.high, price)
                 current.low = min(current.low, price)
-                current.close = price
+                if current.first_trade_at is None or ts < current.first_trade_at:
+                    current.open = price if current.first_trade_at is not None else current.open
+                    current.first_trade_at = ts
+                if current.last_trade_at is None or ts >= current.last_trade_at:
+                    current.close = price
+                    current.last_trade_at = ts
                 current.volume += quantity
                 current.quote_volume += quote_amount
                 current.trade_count += 1
                 current.source_counts[source] = current.source_counts.get(source, 0) + 1
                 current.source_volumes[source] = current.source_volumes.get(source, ZERO) + quantity
                 current.source_quote_volumes[source] = current.source_quote_volumes.get(source, ZERO) + quote_amount
+            current.persisted = False
+            if interval == "1m":
+                kind = Kline.__tablename__ if container is self.live_klines else DisplayKline.__tablename__
+                dirty = self.minute_dirty[(symbol, kind)]
+                dirty.add(open_time)
+                if len(dirty) > 500:
+                    dirty.intersection_update(p.open_time for p in series)
 
     def recent_trade_items(self, symbol: str, limit: int, *, include_seed: bool = False) -> list[dict]:
         items = list(self.recent_trades[symbol])
@@ -620,7 +649,7 @@ class MarketDataService:
                     for source, volume in item.source_quote_volumes.items()
                     if volume > ZERO
                 },
-                "is_closed": item.is_closed,
+                "is_closed": item.is_closed or item.close_time < datetime.now(tz=UTC),
                 "carried_forward": bool(item.carried_forward),
                 "sampled": bool(item.sampled),
                 "display_only": bool(item.display_only or display_only),
@@ -630,9 +659,9 @@ class MarketDataService:
                     {
                         "synthetic": True,
                         "execution_mode": "sampled_display" if item.sampled else "synthetic_ephemeral",
-                        "durable": False,
+                        "durable": item.persisted,
                         "financial_effect": False,
-                        "persistence": "sampled_history" if item.sampled else "display_kline",
+                        "persistence": "minute_aggregate" if item.persisted else "sampled_history" if item.sampled else "display_kline",
                     }
                 )
             serialized.append(payload)
@@ -670,9 +699,9 @@ class MarketDataService:
             include_seed=include_seed,
             display_only=True,
         )
-        # Prefer the display candle for a shared bucket: it is the continuous
-        # chart animation source in this sandbox.  Canonical K-lines remain
-        # untouched and available through get_klines for risk/persistence.
+        # The public series includes BOTH real fills and virtual prints.
+        # Restored complete public candles also supersede real-only history;
+        # adding the two would double-count the real component.
         by_open_time = {int(item["open_time"]): item for item in canonical}
         by_open_time.update({int(item["open_time"]): item for item in display})
         return [by_open_time[key] for key in sorted(by_open_time)[-limit:]]
@@ -753,6 +782,8 @@ class MarketDataService:
         }
 
     async def persist_kline(self, session: AsyncSession, market_id: int, symbol: str, interval: str) -> None:
+        if platform_durable_contract():
+            return  # The minute writer persists closed snapshots outside trading.
         if interval not in {"1m", "5m"}:
             return
         series = self.live_klines[symbol][interval]
@@ -804,6 +835,81 @@ class MarketDataService:
             existing.trade_count = item.trade_count
             existing.source = source
         self.kline_persist_state[persist_key] = (item.open_time, now_ms)
+
+    async def broadcast_klines(self, ws, symbol: str) -> None:
+        for interval in ("1s", "5s", "15s", "1m", "5m", "15m"):
+            items = self.get_public_klines(symbol, interval, 1)
+            if items:
+                await ws.broadcast_public("kline", symbol, {"channel": "kline", "type": "update",
+                    "symbol": symbol, "interval": interval, "kline": items[-1]}, interval=interval)
+
+    async def persist_closed_minutes(self, session, market_id, symbol, *, now=None):
+        """At most two aggregate rows/minute; caller acknowledges AFTER commit.
+
+        OHLCV/count remain cheap and useful for strategy tests. No per-trade
+        SQL, no synthetic Trade/ledger, no writes for the unfinished minute.
+        """
+        now = ensure_utc(now or datetime.now(tz=UTC))
+        tickets = []
+        for model, container in ((Kline, self.live_klines), (DisplayKline, self.display_only_klines)):
+            key = (market_id, model.__tablename__)
+            ack = self.closed_minute_ack.get(key, datetime.min.replace(tzinfo=UTC))
+            # Copy scalars before awaiting; current aggregation can continue.
+            points = [dict(open_time=p.open_time, close_time=p.close_time, open=p.open,
+                high=p.high, low=p.low, close=p.close, volume=p.volume, quote_volume=p.quote_volume,
+                trade_count=p.trade_count, source="public_trades" if model is DisplayKline else p.source)
+                for p in container[symbol]["1m"] if (p.open_time > ack or p.open_time in self.minute_dirty[(symbol, model.__tablename__)]) and p.close_time < now][:60]
+            if not points:
+                continue
+            existing = {ensure_utc(row.open_time): row for row in (await session.scalars(select(model).where(
+                model.market_id == market_id, model.interval == "1m",
+                model.open_time >= points[0]["open_time"], model.open_time <= points[-1]["open_time"]))).all()}
+            for values in points:
+                row = existing.get(values["open_time"])
+                if row is None:
+                    session.add(model(market_id=market_id, interval="1m", **values))
+                else:
+                    for name, value in values.items(): setattr(row, name, value)
+            tickets.append((key, symbol, [(p["open_time"], p["trade_count"]) for p in points]))
+        return tickets
+
+    def acknowledge_closed_minutes(self, tickets):
+        for key, symbol, revisions in tickets:
+            container = self.live_klines if key[1] == Kline.__tablename__ else self.display_only_klines
+            current = {p.open_time: p for p in container[symbol]["1m"]}
+            for time, count in revisions:
+                if time in current and current[time].trade_count == count:
+                    current[time].persisted = True
+                    current[time].is_closed = True
+                    self.minute_dirty[(symbol, key[1])].discard(time)
+            self.closed_minute_ack[key] = max(self.closed_minute_ack.get(key, revisions[-1][0]), revisions[-1][0])
+
+    def _restore_minutes(self, container, symbol, points):
+        """Rebuild larger chart periods from persisted minute aggregates."""
+        minute = {p.open_time: p for p in container[symbol]["1m"]}
+        minute.update({p.open_time: p for p in points})
+        container[symbol]["1m"].clear()
+        container[symbol]["1m"].extend(minute[k] for k in sorted(minute))
+        for interval, seconds in INTERVAL_SECONDS.items():
+            if seconds <= 60: continue
+            buckets = {}
+            for p in container[symbol]["1m"]:
+                start, end = self._bucket(p.open_time, interval)
+                c = buckets.get(start)
+                if c is None:
+                    c = KlinePoint(start, end, p.open, p.high, p.low, p.close, p.volume,
+                        p.quote_volume, p.trade_count, dict(p.source_counts), dict(p.source_volumes),
+                        dict(p.source_quote_volumes), is_closed=end < datetime.now(tz=UTC), persisted=p.persisted)
+                    buckets[start] = c
+                else:
+                    c.high=max(c.high,p.high);c.low=min(c.low,p.low);c.close=p.close
+                    c.volume+=p.volume;c.quote_volume+=p.quote_volume;c.trade_count+=p.trade_count
+                    c.persisted = c.persisted and p.persisted
+                    for attr in ("source_counts","source_volumes","source_quote_volumes"):
+                        dest=getattr(c,attr)
+                        for name,value in getattr(p,attr).items():dest[name]=dest.get(name,0)+value
+            container[symbol][interval].clear()
+            container[symbol][interval].extend(buckets[k] for k in sorted(buckets))
 
     async def persist_display_kline(
         self,
@@ -910,6 +1016,18 @@ class MarketDataService:
         market_id: int,
         symbol: str,
     ) -> None:
+        public_rows = list((await session.scalars(select(DisplayKline).where(
+            DisplayKline.market_id == market_id, DisplayKline.interval == "1m",
+            DisplayKline.source == "public_trades").order_by(DisplayKline.open_time.desc()).limit(500))).all())
+        if public_rows:
+            points = [KlinePoint(ensure_utc(r.open_time), ensure_utc(r.close_time), Decimal(r.open),
+                Decimal(r.high), Decimal(r.low), Decimal(r.close), Decimal(r.volume), Decimal(r.quote_volume),
+                r.trade_count, {"public_trades":r.trade_count}, {"public_trades":Decimal(r.volume)},
+                {"public_trades":Decimal(r.quote_volume)}, is_closed=True, persisted=True) for r in reversed(public_rows)]
+            self._restore_minutes(self.display_only_klines, symbol, points)
+            self.minute_dirty[(symbol, DisplayKline.__tablename__)].difference_update(p.open_time for p in points)
+            self.closed_minute_ack[(market_id, DisplayKline.__tablename__)] = points[-1].open_time
+            return
         result = await session.execute(
             select(DisplayKline)
             .where(
@@ -936,7 +1054,7 @@ class MarketDataService:
                 is_closed=True,
             )
             series = self.display_only_klines[symbol][item.interval]
-            if not series or series[-1].open_time != point.open_time:
+            if not any(p.open_time == point.open_time for p in series):
                 series.append(point)
 
     async def load_from_trades(
@@ -958,14 +1076,15 @@ class MarketDataService:
         result = await session.execute(
             select(Trade)
             .where(*conditions)
-            .order_by(Trade.executed_at.asc())
+            .order_by(Trade.executed_at.desc(), Trade.id.desc())
             .limit(limit)
         )
-        items = list(result.scalars())
+        items = list(reversed(list(result.scalars())))
         if not items:
             return False
         self.recent_trades[symbol].clear()
         self.live_klines[symbol].clear()
+        self.display_only_klines[symbol].clear()
         for trade in items:
             self.ingest_trade(
                 symbol,

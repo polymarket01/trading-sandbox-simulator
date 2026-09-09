@@ -397,7 +397,7 @@ export function OrderbookMonitorPage() {
         <SweepPanel rows={sweepRows} priceDigits={priceDigits} quoteAsset={market?.quote_asset ?? "USDT"} />
       </div>
 
-      <div className="grid gap-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.75fr)]">
+      <div className="grid gap-3 2xl:grid-cols-[minmax(0,1fr)_300px]">
         <section className="panel rounded-2xl p-3">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -411,7 +411,7 @@ export function OrderbookMonitorPage() {
               <span className="rounded-lg bg-rose-500/10 px-2.5 py-1 text-rose-100">卖侧名义 {compactNotional(askNotional)}</span>
             </div>
           </div>
-          <div className="grid gap-3 lg:grid-cols-2">
+          <div className="grid gap-3 min-[1650px]:grid-cols-2">
             <OrderbookSideTable title="买盘" side="bid" rows={bidRows} priceDigits={priceDigits} qtyDigits={qtyDigits} expectedDepth={depthLimit} scaleKey={`${requestedSymbol}:${depthLimit}`} />
             <OrderbookSideTable title="卖盘" side="ask" rows={askRows} priceDigits={priceDigits} qtyDigits={qtyDigits} expectedDepth={depthLimit} scaleKey={`${requestedSymbol}:${depthLimit}`} />
           </div>
@@ -606,7 +606,7 @@ function OrderbookSideTable({
         <span className="text-xs text-slate-500">{rows.length} 档</span>
       </div>
       <div className="scrollbar overflow-x-auto">
-        <div className="grid min-w-[680px] grid-cols-[44px_minmax(108px,1fr)_minmax(96px,0.8fr)_minmax(116px,0.9fr)_78px_minmax(140px,1fr)] gap-2 px-3 py-2 text-xs uppercase tracking-[0.14em] text-slate-500">
+        <div className="grid min-w-[570px] grid-cols-[28px_minmax(80px,1fr)_minmax(76px,0.8fr)_minmax(90px,0.9fr)_65px_minmax(112px,1fr)] gap-2 px-3 py-2 text-xs uppercase tracking-[0.14em] text-slate-500">
           <span>#</span>
           <span className="text-right">价格</span>
           <span className="text-right">数量</span>
@@ -677,7 +677,7 @@ const OrderbookTableRow = memo(function OrderbookTableRow({
       data-price={price}
       data-row-key={price}
       data-depth-pct={width.toFixed(4)}
-      className="book-row-stable relative grid min-w-[680px] grid-cols-[44px_minmax(108px,1fr)_minmax(96px,0.8fr)_minmax(116px,0.9fr)_78px_minmax(140px,1fr)] gap-2 border-t border-white/5 px-3 py-1.5 font-mono text-sm tabular-nums"
+      className="book-row-stable relative grid min-w-[570px] grid-cols-[28px_minmax(80px,1fr)_minmax(76px,0.8fr)_minmax(90px,0.9fr)_65px_minmax(112px,1fr)] gap-2 border-t border-white/5 px-3 py-1.5 font-mono text-sm tabular-nums"
       title={`数量 ${fmtQuantity(quantity, qtyDigits)}，名义 ${fullNotional(notional)}，累计 ${fullNotional(cumulative)}`}
     >
       <span className={`pointer-events-none absolute inset-y-1 ${side === "bid" ? "right-0" : "left-0"} ${heatClass}`} style={{ width: `${width}%` }} />

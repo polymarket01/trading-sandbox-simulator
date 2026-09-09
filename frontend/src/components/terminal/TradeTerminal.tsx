@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { KlineChart } from "../KlineChart";
 import { sanitizeKlines } from "../../lib/kline";
 import { fmt } from "../../lib/format";
@@ -79,6 +79,10 @@ export function TradeTerminal(props: TerminalProps) {
   const availableBalance = isPerp ? perpAccount?.available_margin : baseBalance;
   const accountPnl = isPerp ? perpAccount?.unrealized_pnl : undefined;
 
+  const selectBookPrice = useCallback((price: string) => {
+    const value = Number(price);
+    if (Number.isFinite(value) && value > 0) setOrderPanelState({ price: value.toFixed(priceDigits) });
+  }, [setOrderPanelState, priceDigits]);
   return (
     <div className="hl-terminal">
       <TerminalHeader
@@ -161,10 +165,7 @@ export function TradeTerminal(props: TerminalProps) {
             myOrderPrices={userOrderPrices}
             onDepthChange={onDepthChange}
             onMergeChange={onMergeChange}
-            onSelectPrice={(price) => {
-              const value = Number(price);
-              if (Number.isFinite(value) && value > 0) setOrderPanelState({ price: value.toFixed(priceDigits) });
-            }}
+            onSelectPrice={selectBookPrice}
             heightClass="h-full"
           />
           <TerminalTrades items={displayTrades} priceDigits={priceDigits} quantityDigits={quantityDigits} heightClass="h-full" />

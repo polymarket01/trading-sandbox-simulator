@@ -490,3 +490,38 @@ async def save_plugin_parameters(symbol: str, body: PluginParametersSave, reques
         raise HTTPException(409, str(exc)) from exc
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from exc
+
+@router.get('/admin/liquidity/overview', dependencies=[Depends(get_admin_user)])
+async def overview(request: Request, session=Depends(get_db_session)):
+    """Configuration list: three bounded queries, no account funding probes or order serialization."""
+    from app.api.admin import maker_instance_status
+    markets=(await session.scalars(select(Market).order_by(Market.symbol))).all()
+    configs=(await session.scalars(select(MarketStrategyConfig).where(MarketStrategyConfig.is_enabled.is_(True)))).all()
+    selected={c.market_id:c.strategy_key for c in configs}
+    bindings=(await session.execute(select(MarketBotAccount,User.username).join(User,User.id==MarketBotAccount.user_id).where(MarketBotAccount.is_enabled.is_(True),User.is_active.is_(True)))).all()
+    groups={}
+    for binding,name in bindings:
+        if binding.strategy_role=='paper_default':continue
+        groups.setdefault(binding.market_id,[]).append((binding,name))
+    manager=getattr(request.app.state,'contract_ladder_service',None)
+    items=[];instances=[]
+    for market in markets:
+        key=selected.get(market.id,'NONE')
+        worker=manager.workers.get(market.symbol) if manager else None
+        state={'state':worker.state,'enabled':bool(worker.config.get('enabled'))} if worker else None
+        if worker:
+            status={'symbol':market.symbol,'running':state['enabled'],'status':worker.state}
+        else:
+            legacy=maker_instance_status(market.symbol,request,configured_strategy_version=key)
+            status={'symbol':market.symbol,'running':bool(legacy.get('running')),'status':legacy.get('status','STOPPED')}
+        instances.append(status)
+        accounts=groups.get(market.id,[])
+        makers=[{'uid':b.user_id,'username':name} for b,name in accounts if b.role=='maker' and ((b.strategy_role=='CONTRACT_LADDER')==(key in INTERNAL_MAKER_STRATEGIES))]
+        choices=strategy_choices(market.product_type)
+        items.append({'symbol':market.symbol,'product_type':market.product_type,'strategy_key':key,'choices':choices,
+            'parameter_editors':{k:'schema' if get_plugin(k).manifest.get('parameters') else 'legacy' for k in choices},
+            'source_exchange':'binance','source_symbol':market.price_source_symbol or market.symbol.removesuffix('-PERP'),
+            'readiness':{'scope':'configuration','ok':False,'blockers':[]},'ladder':state,
+            'account_slots':{k:ACCOUNT_SLOTS[k] for k in choices},'maker_accounts':makers,
+            'flow_accounts':[{'uid':b.user_id,'username':name} for b,name in accounts if b.role=='flow']})
+    return {'items':items,'instances':instances,'switch_supported':True,'switches':switch_states(request.app.state.runtime)}

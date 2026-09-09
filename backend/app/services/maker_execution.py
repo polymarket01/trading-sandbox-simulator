@@ -98,6 +98,8 @@ class MakerExecutionWorker:
             if oid in self.slots:
                 self._by_slot.setdefault(self.slots[oid], []).append(order)
         self.on_orders_refreshed()
+        # Successful authoritative I/O is progress even during a long reconciliation.
+        self.heartbeat = time.monotonic()
         return self.orders
 
     def _assign_slot(self, order, slot):
@@ -126,6 +128,7 @@ class MakerExecutionWorker:
                 result = await asyncio.shield(task)
             self._latencies.append((time.monotonic()-now)*1000)
             self.unknown = None
+            self.heartbeat = time.monotonic()
             return result
         except asyncio.CancelledError:
             raise
@@ -164,9 +167,16 @@ class MakerExecutionWorker:
         self._counter += 1
         cid = f"cl-{self._run}-{slot[0][0]}{slot[1]}-{self._counter}"
         self.last_placed[slot] = time.monotonic()
-        result = await self._perform(self.adapter.place(
+        place = self.adapter.place
+        admission = {}
+        checked = getattr(self.adapter, "place_checked", None)
+        if checked is not None:
+            target = self.latest
+            place = checked
+            admission["admission_check"] = lambda: self._target_current(target)
+        result = await self._perform(place(
             self.symbol, self.uid, client_order_id=cid, side=target_order["side"].lower(),
-            price=target_order["price"], quantity=target_order["qty"]), kind="place", request={"client_order_id": cid})
+            price=target_order["price"], quantity=target_order["qty"], **admission), kind="place", request={"client_order_id": cid})
         order = result["order"]
         self.slots[order["order_id"]] = slot
         await self._refresh_orders()

@@ -84,7 +84,9 @@ export function ContractOrderForm({
   const [quantity, setQuantity] = useState("");
   const [leverage, setLeverage] = useState(setting?.leverage ?? market?.default_leverage ?? "5");
   const [savingLeverage, setSavingLeverage] = useState(false);
-  const meta = intentMeta[intent];
+  const hedge = setting?.position_mode === "hedge";
+  const labelFor = (item: ContractIntent) => !hedge && item === "open_long" ? "买入" : !hedge && item === "open_short" ? "卖出" : intentMeta[item].label;
+  const meta = { ...intentMeta[intent], label: labelFor(intent) };
   const tradingMode = market?.contract_trading_mode ?? "normal";
   const intentDisabled = tradingMode === "paused" || (tradingMode === "reduce_only" && meta.positionAction === "open");
   const mark = Number(priceState?.mark_price || ticker?.mid_price || ticker?.last_price || selectedPrice || price || 0);
@@ -183,7 +185,7 @@ export function ContractOrderForm({
               intent === item ? intentMeta[item].tone : "border-transparent bg-white/5 text-slate-300 hover:bg-white/8"
             } disabled:cursor-not-allowed disabled:opacity-40`}
           >
-            {intentMeta[item].label}
+            {labelFor(item)}
           </button>
         ))}
       </div>
@@ -237,7 +239,7 @@ export function ContractOrderForm({
           <div className="mt-1 font-mono text-slate-100">{fmt(notional, 4)} {market?.quote_asset ?? "USDT"}</div>
         </div>
         <div className="rounded-xl bg-white/5 px-3 py-2">
-          <div className="text-slate-500">初始保证金</div>
+          <div className="text-slate-500">全量开仓保证金参考</div>
           <div className={`mt-1 font-mono ${marginRisk ? "text-rose-300" : "text-slate-100"}`}>{fmt(initialMargin, 4)} {market?.margin_asset ?? "USDT"}</div>
         </div>
         <div className="rounded-xl bg-white/5 px-3 py-2">
@@ -251,7 +253,7 @@ export function ContractOrderForm({
       </div>
       {marginRisk && (
         <div className="mt-3 rounded-xl border border-rose-500/16 bg-rose-500/8 px-3 py-2 text-xs leading-5 text-rose-100">
-          预估初始保证金高于当前可用保证金，提交后可能被风控拒绝。
+          全量开仓估算高于可用保证金；实际冻结按持仓及已有委托计算，减仓部分不按新增仓位冻结。
         </div>
       )}
       <button
@@ -263,7 +265,7 @@ export function ContractOrderForm({
         提交{meta.label}
       </button>
       <div className="mt-3 text-xs leading-5 text-slate-500">
-        双向持仓 · 逐仓保证金 · 风控 {tradingModeLabel[tradingMode] ?? tradingMode}
+        {hedge ? "双向持仓" : "单向净额：反向成交先减仓，超出部分反手"} · 逐仓保证金 · 风控 {tradingModeLabel[tradingMode] ?? tradingMode}
       </div>
     </section>
   );

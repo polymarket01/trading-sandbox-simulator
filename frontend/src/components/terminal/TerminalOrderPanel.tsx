@@ -68,7 +68,7 @@ export function TerminalOrderPanel({
   else if (amount > 0 && amount < minNotional) validation = { tone: "warn", text: `Below minimum value ${minNotional} USDT` };
   else if (!isPerp && state.side === "buy" && amount > availableQuote) validation = { tone: "sell", text: "Insufficient balance" };
   else if (!isPerp && state.side === "sell" && quantity > availableBase) validation = { tone: "sell", text: `Insufficient ${baseAsset}` };
-  else if (isPerp && state.positionAction === "open" && estimatedMargin > available) validation = { tone: "sell", text: "Insufficient margin" };
+  else if (isPerp && state.positionAction === "open" && estimatedMargin > available) validation = { tone: "sell", text: "全量开仓估算超出可用保证金；实际冻结由持仓和已有委托决定" };
 
   const buyActive = state.side === "buy";
   const statusBlocked = !["TRADING", "REDUCE_ONLY"].includes(marketStatus);
@@ -77,7 +77,7 @@ export function TerminalOrderPanel({
   const submitLabel = submitting
     ? "Submitting..."
     : isPerp
-      ? `提交${state.positionAction === "open" ? (state.side === "buy" ? "开多" : "开空") : (state.side === "buy" ? "平空" : "平多")}单`
+      ? `提交${state.positionAction === "open" ? (state.side === "buy" ? "买入" : "卖出") : (state.side === "buy" ? "平空" : "平多")}单`
       : `${state.side === "buy" ? "Buy" : "Sell"} ${market?.base_asset ?? ""}`;
 
   const setPercent = (percent: number) => {
@@ -123,7 +123,7 @@ export function TerminalOrderPanel({
 
       {isPerp ? (
         <div className="mb-2 grid shrink-0 grid-cols-2 gap-1">
-          <button type="button" onClick={() => onChange({ positionAction: "open" })} className={`rounded px-2 py-1.5 text-[10px] ${state.positionAction === "open" ? "bg-cyan-400/15 text-cyan-100" : "bg-white/5 text-slate-500"}`} title="选择开仓模式；点击底部提交按钮下单">开仓模式</button>
+          <button type="button" onClick={() => onChange({ positionAction: "open" })} className={`rounded px-2 py-1.5 text-[10px] ${state.positionAction === "open" ? "bg-cyan-400/15 text-cyan-100" : "bg-white/5 text-slate-500"}`} title="普通买卖；单向模式下反向成交先减仓，超出部分反手">普通买卖</button>
           <button type="button" onClick={() => onChange({ positionAction: "close" })} className={`rounded px-2 py-1.5 text-[10px] ${state.positionAction === "close" ? "bg-amber-400/15 text-amber-100" : "bg-white/5 text-slate-500"}`} title="选择仅减仓模式；点击底部提交按钮下单">平仓模式</button>
         </div>
       ) : null}

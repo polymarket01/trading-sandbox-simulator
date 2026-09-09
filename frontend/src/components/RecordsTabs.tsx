@@ -197,7 +197,7 @@ export function RecordsTabs({
                       <td className={`py-2 ${sideColor(item.side ?? item.taker_side)}`}>
                         {item.side === "buy" || item.taker_side === "buy" ? "买" : "卖"}
                         {item.position_action || item.taker_position_action ? (
-                          <span className="ml-1 text-slate-500">· {item.position_action === "close" || item.taker_position_action === "close" ? "平仓" : "开仓"}</span>
+                          <span className="ml-1 text-slate-500">· {(item.position_action ?? item.taker_position_action) === "reverse" ? "减仓并反手" : (item.position_action ?? item.taker_position_action) === "close" ? "平仓" : "开仓"}</span>
                         ) : null}
                       </td>
                       <td className="py-2 text-right text-slate-200">{fmt(item.price, priceDigits)}</td>

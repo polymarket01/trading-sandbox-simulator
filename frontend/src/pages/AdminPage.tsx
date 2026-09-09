@@ -1,3 +1,4 @@
+import { appBasePath } from "../lib/config";
 import { InstalledMakerSelect } from "../components/InstalledMakerSelect";
 import { StrategyCatalogPage } from "./StrategyCatalogPage";
 import { LiquidityControlPage } from "./LiquidityControlPage";
@@ -1883,7 +1884,7 @@ const contractClearingOrderTradeBuckets: ContractClearingOrderTradeBucket[] = [
 function contractClearingOrderTradeBucketLabel(bucket: ContractClearingOrderTradeBucket) {
   if (bucket === "live_margin") return "当前委托 / 保证金";
   if (bucket === "filled_settlement") return "成交费用 / PnL";
-  if (bucket === "close_reduce") return "平仓 / Reduce-only";
+  if (bucket === "close_reduce") return "含减仓 / 只减仓";
   if (bucket === "rejected_canceled") return "拒单 / 撤单";
   if (bucket === "robot_system") return "机器人 / 系统单据";
   return "未知单据";
@@ -1895,7 +1896,7 @@ function contractOrderIsCloseReduce(order: OrderItem) {
 
 function contractTradeIsCloseReduce(trade: TradeItem) {
   return [trade.position_action, trade.taker_position_action, trade.maker_position_action]
-    .some((action) => String(action ?? "").toLowerCase() === "close");
+    .some((action) => ["close", "reverse"].includes(String(action ?? "").toLowerCase()));
 }
 
 function contractOrderUserIsRobotOrSystem(user: ContractAdminUser) {
@@ -1941,8 +1942,8 @@ function contractClearingOrderTradeReview(bucket: ContractClearingOrderTradeBuck
   }
   if (bucket === "close_reduce") {
     return {
-      scope: "平仓、只减仓或成交侧 close 语义，通常影响仓位数量、已实现 PnL 和保证金释放。",
-      verificationPath: "核对 reduce_only / position_action、成交侧 taker/maker close、仓位变化、保证金释放和风险参数中的只减仓模式。",
+      scope: "包含平仓、只减仓及减仓后反手成交；reverse 同时含新增风险，不能视为只减仓。",
+      verificationPath: "核对 reduce_only / position_action、成交侧 taker/maker close/reverse、仓位变化、保证金释放和风险参数中的只减仓模式。",
       boundary: "该分组不是强制平仓或 ADL 入口；异常平仓、强平和自动减仓仍回强平 / ADL 页处理。",
     };
   }
@@ -2625,6 +2626,7 @@ export function AdminPage() {
   const pushToast = useAppStore((state) => state.pushToast);
   const adminApiKey = authSession?.role === "admin" ? authSession.api_key : "";
   const [adminSection, setAdminSection] = useState<AdminSection>(() => adminSectionFromSearch(location.search));
+  const lightweightLiquiditySection = adminSection === "maker_config" || adminSection === "flow_config";
   const [selectedMarketSymbol, setSelectedMarketSymbol] = useState(() => marketSymbolFromSearch(location.search));
   const [marketDetailTab, setMarketDetailTab] = useState<MarketDetailTab>(() => marketDetailTabFromSearch(location.search));
   const [contractAdminTab, setContractAdminTab] = useState<ContractAdminTab>(() => contractAdminTabFromSearch(location.search));
@@ -3411,8 +3413,10 @@ export function AdminPage() {
   }, [adminApiKey, auditDataScope, auditProduct, auditStatus, auditSymbol, auditUserId, pushToast]);
 
   useEffect(() => {
-    void load();
-  }, [adminApiKey]);
+    if (lightweightLiquiditySection) return;
+    const timer = window.setTimeout(() => void load(), 100);
+    return () => window.clearTimeout(timer);
+  }, [adminApiKey, lightweightLiquiditySection]);
 
   useEffect(() => {
     if (!adminApiKey || adminSection !== "accounting" || accountingEvidenceLoadedRef.current) return;
@@ -3441,7 +3445,7 @@ export function AdminPage() {
   }, [adminApiKey, adminSection, contractDetailsLoaded, contractDetailsLoading, refreshContractDetails]);
 
   useEffect(() => {
-    if (!adminApiKey) return;
+    if (!adminApiKey || lightweightLiquiditySection) return;
     const selectedMarket = selectedMarketSymbol ? markets[selectedMarketSymbol] : undefined;
     const shouldPollContracts = adminSection === "contracts" || adminSection === "risk" || selectedMarket?.product_type === "PERP";
     if (!shouldPollContracts) return;
@@ -4550,7 +4554,7 @@ export function AdminPage() {
     const requestedAuditDomain = orderAuditDataScopeFromParam(params.get("auditDomain") || params.get("auditDataScope") || params.get("dataDomain") || "");
     const needsMarketData = Boolean(requestedSymbol || requestedAuditSymbol);
     const needsUserData =
-      Number.isFinite(requestedUserId)
+      Boolean(params.get("userId") && Number.isFinite(requestedUserId))
       || Boolean(requestedAuditUserId && requestedAuditUserId !== "all");
     if ((needsMarketData && marketSymbols.length === 0) || (needsUserData && users.length === 0)) return;
     const validSection = adminSectionKeys.includes(requestedSection);
@@ -4638,7 +4642,7 @@ export function AdminPage() {
   }, [location.search, marketSymbols, marketStrategies, markets, pushToast, refreshAdminOperations, users]);
 
   useEffect(() => {
-    if (!adminApiKey || marketSymbols.length === 0) return;
+    if (!adminApiKey || (marketSymbols.length === 0 && !lightweightLiquiditySection)) return;
     if (skipUrlSyncOnce.current) {
       skipUrlSyncOnce.current = false;
       return;
@@ -12384,16 +12388,16 @@ function TestAdminQuickPaths({
       </div>
       <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-white/8 pt-3 text-xs">
         <span className="mr-1 text-slate-500">交易与流动性观察</span>
-        <a href="/spot/trade/BTCUSDT" className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
+        <a href={appBasePath + "/spot/trade/BTCUSDT"} className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
           现货交易
         </a>
-        <a href="/spot/orderbook/BTCUSDT" className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
+        <a href={appBasePath + "/spot/orderbook/BTCUSDT"} className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
           现货流动性
         </a>
-        <a href="/contracts/trade/BTCUSDT-PERP" className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
+        <a href={appBasePath + "/contracts/trade/BTCUSDT-PERP"} className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
           合约交易
         </a>
-        <a href="/contracts/orderbook/BTCUSDT-PERP" className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
+        <a href={appBasePath + "/contracts/orderbook/BTCUSDT-PERP"} className="rounded-xl bg-white/8 px-3 py-1.5 text-slate-200 transition hover:bg-cyan-400/16 hover:text-cyan-100">
           合约流动性
         </a>
       </div>
@@ -16225,9 +16229,9 @@ function AdminSidebar({
       <div className="mb-3 flex items-center justify-between gap-2 border-b border-white/8 pb-3">
         <div>
           <div className="text-sm font-medium text-white">管理后台</div>
-          <div className="mt-1 text-xs text-slate-500">{userCount} 主体 · {marketCount} 市场</div>
+          {section !== "maker_config" && section !== "flow_config" && <div className="mt-1 text-xs text-slate-500">{userCount} 主体 · {marketCount} 市场</div>}
         </div>
-        <span className={`rounded-full px-2 py-1 text-[11px] ${statusClass}`}>{status === "critical" ? "需处理" : status === "warn" ? "需关注" : status ? "正常" : "读取中"}</span>
+        {section !== "maker_config" && section !== "flow_config" && <span className={`rounded-full px-2 py-1 text-[11px] ${statusClass}`}>{status === "critical" ? "需处理" : status === "warn" ? "需关注" : status ? "正常" : "读取中"}</span>}
       </div>
       <nav aria-label="后台功能" className="space-y-4">
         {adminNavGroups.map((group) => (

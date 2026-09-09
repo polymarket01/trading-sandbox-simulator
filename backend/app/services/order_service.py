@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.matching_faults import BusinessRejected, NotExecuted
+
 from app.services.maker_permissions import min_notional_exempt
 
 import asyncio
@@ -75,7 +77,7 @@ from app.services.persistence_contract import (
 from exchange_common.quote_pipeline import SelfTradePolicy
 
 
-class OrderValidationError(Exception):
+class OrderValidationError(BusinessRejected):
     pass
 
 
@@ -195,6 +197,11 @@ class OrderService:
         return quantize_scale(value, market.qty_precision)
 
     def _normalize_payload(self, market: Market, payload) -> None:
+        # Integer markets reject fractions before normalization; never change the requested amount.
+        if market.qty_precision == 0 and to_decimal(payload.quantity) != to_decimal(payload.quantity).to_integral_value():
+            raise OrderValidationError("quantity must be an integer for this market")
+        if market.price_precision == 0 and payload.price is not None and to_decimal(payload.price) != to_decimal(payload.price).to_integral_value():
+            raise OrderValidationError("price must be an integer for this market")
         payload.quantity = self._normalize_qty(market, payload.quantity)
         if payload.price is not None:
             payload.price = self._normalize_price(market, payload.price)
@@ -406,9 +413,8 @@ class OrderService:
                     )
                 )
                 existing.add(str(snap["order_id"]))
-        self.runtime.engine.clear_market(market.symbol)
-        for book_order in book_orders:
-            self.runtime.engine.load_resting_order(market.symbol, book_order)
+        recovery = self.runtime.engine.rebuild_market(market.symbol, book_orders)
+        self._last_book_recovery = {"symbol": market.symbol, **recovery}
         self.runtime.orderbook_snapshot_unlocked(market.symbol, 50)
         return self.runtime.record_orderbook_reconcile(
             market.symbol,
@@ -924,6 +930,8 @@ class OrderService:
         }
 
     async def cancel_order(self, session: AsyncSession, user: User, order_id: str, *, admin_override: bool = False) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         record = await self._load_order_market(session, order_id)
         if record is None:
             raise OrderValidationError("order not found")
@@ -943,6 +951,7 @@ class OrderService:
                 raise OrderValidationError("use contract order API for PERP markets")
             if order.status not in {ORDER_STATUS_NEW, ORDER_STATUS_PARTIALLY_FILLED}:
                 raise OrderValidationError("order is not cancelable")
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
             sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
                 CancelOrderCommand(order_id=order.order_id)
             )
@@ -1023,6 +1032,8 @@ class OrderService:
         return {"order_id": order.order_id, "status": order.status}
 
     async def amend_order(self, session: AsyncSession, user: User, order_id: str, payload, *, admin_override: bool = False) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         record = await self._load_order_market(session, order_id)
         if record is None:
             raise OrderValidationError("order not found")
@@ -1069,6 +1080,7 @@ class OrderService:
             if new_price == current_price and new_quantity == current_quantity:
                 return {"order": await self.serialize_order(session, order, market.symbol), "kept_priority": True}
 
+            await acquire_sqlite_write_admission(session, existing_order_id=order_id)
             await self._adjust_resting_reserve(
                 session,
                 market,
@@ -1243,6 +1255,8 @@ class OrderService:
         return {"order_id": order.order_id, "status": order.status}
 
     async def amend_order_batch(self, session: AsyncSession, user: User, payload) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         order_ids = [item.order_id for item in payload.orders]
         if len(set(order_ids)) != len(order_ids):
             raise OrderValidationError("duplicate order_id in batch")
@@ -1257,7 +1271,7 @@ class OrderService:
                 select(Order, Market)
                 .join(Market, Market.id == Order.market_id)
                 .where(Order.order_id.in_(order_ids))
-                .with_for_update()
+                .with_for_update().execution_options(populate_existing=True)
             )
             loaded = rows.all()
             if len(loaded) != len(order_ids):
@@ -1373,6 +1387,7 @@ class OrderService:
                 raise OrderValidationError("orders is required")
 
             if batch_items:
+                await acquire_sqlite_write_admission(session, existing_order_id=batch_items[0].order_id)
                 for entry in prepared:
                     if not entry["changed"]:
                         continue
@@ -1462,6 +1477,8 @@ class OrderService:
         admin_override: bool = False,
         target_user_id: int | None = None,
     ) -> dict:
+        from app.services.sqlite_write_admission import acquire_sqlite_write_admission
+
         market = await self._get_market(session, symbol)
         if market.product_type != PRODUCT_TYPE_SPOT:
             raise OrderValidationError("use contract order API for PERP markets")
@@ -1479,6 +1496,8 @@ class OrderService:
                 stmt = stmt.where(Order.user_id == user.id)
             rows = await session.execute(stmt)
             orders = list(rows.scalars())
+            if orders:
+                await acquire_sqlite_write_admission(session, existing_order_id=orders[0].order_id)
             now = datetime.now(tz=UTC)
             changed_bids: list[list[str]] = []
             changed_asks: list[list[str]] = []
@@ -2387,11 +2406,9 @@ class OrderService:
     ) -> tuple[dict[str, Order], set[int], list[dict], Decimal]:
         maker_order_ids = {fill.maker_order_id for fill in result.fills}
         maker_orders = await self._load_orders_map(session, maker_order_ids)
-        if len(maker_orders) < len(maker_order_ids):
-            writer = getattr(self.runtime, "persistence_writer", None)
-            if writer is not None:
-                await writer.flush(timeout=2.0)
-            maker_orders = await self._load_orders_map(session, maker_order_ids)
+        # The taker transaction already owns SQLite's writer lock. Waiting for
+        # another connection to materialize a missing maker would deadlock it.
+        # Missing financial facts remain an explicit consistency failure.
         if len(maker_orders) < len(maker_order_ids):
             missing = sorted(maker_order_ids - set(maker_orders))
             raise OrderValidationError(f"maker orders not persisted: {missing}")
@@ -3607,6 +3624,7 @@ class OrderService:
         return deltas
 
     def _fast_writer_ready(self) -> bool:
+        self.runtime.engine.fault.check()
         writer = getattr(self.runtime, "persistence_writer", None)
         if writer is None:
             return False
@@ -3621,7 +3639,16 @@ class OrderService:
         writer = getattr(self.runtime, "persistence_writer", None)
         if writer is None:
             raise OrderValidationError("persistence writer unavailable")
-        if str(settings.core_mode or "legacy").lower() == "unified":
+        from app.services.persistence_contract import facts_durable
+
+        if callable(getattr(writer, "is_capturing", None)) and writer.is_capturing():
+            # The enclosing QuoteSet owns its single durable execution tail.
+            writer.enqueue(task)
+            return
+        result = task.get("engine_result") or {}
+        ephemeral = callable(getattr(writer, "is_ephemeral_quote_task", None)) and writer.is_ephemeral_quote_task(task)
+        if ((str(settings.core_mode or "legacy").lower() == "unified" and not ephemeral)
+                or (facts_durable() and bool(result.get("fills")))):
             await writer.enqueue_durable(task)
             return
         if writer.enqueue(task):
@@ -3861,27 +3888,32 @@ class OrderService:
                 effective_command_sequence = None
             else:
                 raise OrderValidationError("stale place priority sequence")
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             if reserve.amount > ZERO:
                 try:
                     self.runtime.clearinghouse.reserve_spot(user.id, reserve.asset, reserve.amount)
                 except ValueError as exc:
                     raise OrderValidationError(str(exc)) from exc
-            sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
-                NewOrderCommand(
-                    order_id=order_id,
-                    user_id=user.id,
-                    side=payload.side,
-                    quantity=Decimal(payload.quantity),
-                    created_at=now,
-                    limit_price=Decimal(payload.price) if payload.price is not None else None,
-                    can_rest=payload.type == ORDER_TYPE_LIMIT and payload.tif in {TIF_GTC, TIF_POST_ONLY},
-                    max_price=max_price,
-                    min_price=min_price,
-                    sequence_number=effective_command_sequence,
-                    **self._stp_context(user),
+            try:
+                sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
+                    NewOrderCommand(
+                        order_id=order_id,
+                        user_id=user.id,
+                        side=payload.side,
+                        quantity=Decimal(payload.quantity),
+                        created_at=now,
+                        limit_price=Decimal(payload.price) if payload.price is not None else None,
+                        can_rest=payload.type == ORDER_TYPE_LIMIT and payload.tif in {TIF_GTC, TIF_POST_ONLY},
+                        max_price=max_price,
+                        min_price=min_price,
+                        sequence_number=effective_command_sequence,
+                        **self._stp_context(user),
+                    )
                 )
-            )
+            except NotExecuted:
+                if reserve.amount > ZERO:
+                    self.runtime.clearinghouse.release_spot(user.id, reserve.asset, reserve.amount)
+                raise
             result = sequencer_result.engine_result
             if result is None:
                 raise OrderValidationError("sequencer did not return engine result")
@@ -4020,7 +4052,7 @@ class OrderService:
         started = time.perf_counter()
         market = await self._get_market(session, snap["symbol"])
         now = now or datetime.now(tz=UTC)
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
                 CancelOrderCommand(order_id=order_id, sequence_number=command_sequence)
             )
@@ -4188,7 +4220,7 @@ class OrderService:
                 effective_command_sequence = None
             else:
                 raise OrderValidationError("stale amend priority sequence")
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             if crossing_book:
                 sequencer_result = await self.runtime.get_symbol_sequencer(market.symbol).submit(
                     CrossingAmendCommand(
@@ -4401,7 +4433,7 @@ class OrderService:
 
         changed_bids: list[list[str]] = []
         changed_asks: list[list[str]] = []
-        async with self.runtime.clearinghouse.global_lock:
+        async with self.runtime.fast_matching_guard(market.symbol):
             # Recheck engine membership under the same financial lock used by
             # FLOW and every fast mutation.  One missing order must not make
             # MatchingEngine reject the entire batch after balances have

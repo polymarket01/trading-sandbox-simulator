@@ -31,6 +31,7 @@ class Order(Base):
     side: Mapped[str] = mapped_column(String(8), nullable=False)
     position_action: Mapped[str | None] = mapped_column(String(16))
     reduce_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reserved_margin: Mapped[Decimal | None] = mapped_column(Numeric(36, 18))
     leverage: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     tif: Mapped[str] = mapped_column(String(16), nullable=False)

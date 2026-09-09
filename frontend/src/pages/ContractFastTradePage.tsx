@@ -473,7 +473,7 @@ function QuickContractOpenOrders({
       </div>
       <div className="max-h-[220px] space-y-2 overflow-auto pr-1">
         {orders.slice(0, 8).map((item) => {
-          const action = item.position_action === "close" || item.reduce_only ? "平仓" : "开仓";
+          const action = item.position_action === "close" || item.reduce_only ? "只减仓" : "普通委托";
           return (
             <div key={item.order_id} className="rounded-xl bg-white/5 px-3 py-2">
               <div className="flex items-center justify-between gap-2">

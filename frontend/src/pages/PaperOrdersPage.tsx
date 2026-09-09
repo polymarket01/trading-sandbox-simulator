@@ -331,7 +331,7 @@ export function PaperOrdersPage() {
                           <td className={`py-2 ${sideColor(item.side ?? item.taker_side)}`}>
                             {item.side === "buy" || item.taker_side === "buy" ? "买" : "卖"}
                             {item.position_action || item.taker_position_action ? (
-                              <span className="ml-1 text-slate-500">· {item.position_action === "close" || item.taker_position_action === "close" ? "平" : "开"}</span>
+                              <span className="ml-1 text-slate-500">· {(item.position_action ?? item.taker_position_action) === "reverse" ? "减仓并反手" : (item.position_action ?? item.taker_position_action) === "close" ? "平" : "开"}</span>
                             ) : null}
                           </td>
                           <td className="py-2 text-right text-slate-200">{fmt(item.price, 8)}</td>
@@ -472,7 +472,7 @@ function OrderTable({
                 <td className={`py-2 ${sideColor(order.side)}`}>{order.side === "buy" ? "买" : "卖"}</td>
                 <td className="py-2 text-slate-400">
                   {typeLabel(order.type)} · {tifLabel(order.tif)}
-                  {order.position_action ? <span className="ml-1 text-slate-500">· {order.position_action === "close" ? "平仓" : "开仓"}</span> : null}
+                  {order.position_action ? <span className="ml-1 text-slate-500">· {order.position_action === "close" ? "只减仓" : "普通委托"}</span> : null}
                 </td>
                 <td className="py-2 text-right text-slate-200">{order.type === "limit" ? fmt(order.price, 8) : "市价"}</td>
                 <td className="py-2 text-right text-slate-300">{fmt(order.quantity, 8)}</td>

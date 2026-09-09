@@ -44,7 +44,7 @@ async def login(
             User.is_active.is_(True),
         )
     )
-    if user is None or not verify_password(payload.password, user.password_hash):
+    if user is None or user.role == "mm_bot" or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误")
     if paper_product_enabled():
         raw_token = await create_session(
@@ -60,7 +60,7 @@ async def login(
             httponly=True,
             secure=bool(settings.paper_exchange_cookie_secure),
             samesite="lax",
-            path="/",
+            path=(settings.public_base_path.rstrip("/") + "/"),
         )
     return {"user": serialize_login_user(user), "paper_mode": paper_product_enabled()}
 
@@ -96,7 +96,7 @@ async def register(
         httponly=True,
         secure=bool(settings.paper_exchange_cookie_secure),
         samesite="lax",
-        path="/",
+        path=(settings.public_base_path.rstrip("/") + "/"),
     )
     return {"user": serialize_login_user(user), "paper_mode": True}
 
@@ -113,7 +113,7 @@ async def logout(
     session: AsyncSession = Depends(get_db_session),
 ):
     await delete_session(session, request.cookies.get(settings.paper_exchange_cookie_name))
-    response.delete_cookie(settings.paper_exchange_cookie_name, path="/")
+    response.delete_cookie(settings.paper_exchange_cookie_name, path=(settings.public_base_path.rstrip("/") + "/"))
     return {"ok": True}
 
 
@@ -128,3 +128,18 @@ async def change_password(
     user.password_hash = hash_password(payload.new_password)
     await session.commit()
     return {"ok": True}
+
+
+@router.get("/auth/api-key")
+async def own_api_key(response: Response, user: User = Depends(get_current_user), session: AsyncSession = Depends(get_db_session)):
+    if user.role == "mm_bot":
+        raise HTTPException(403, "机器人身份不提供对外凭据")
+    from app.core.security import generate_api_key, generate_api_secret
+    if not user.api_key:
+        user.api_key = generate_api_key("user")
+    if not user.api_secret_hash:
+        user.api_secret_hash = generate_api_secret()
+    await session.flush()
+    response.headers["Cache-Control"] = "no-store"
+    return {"username": user.username, "api_key": user.api_key, "api_secret": user.api_secret_hash,
+            "authentication": "X-API-Key", "scope": "own_account", "is_simulated": True}

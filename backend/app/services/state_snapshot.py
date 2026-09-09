@@ -49,6 +49,10 @@ class StateSnapshotService:
         watermarks: dict[str, Any] | None = None,
         committed: bool = True,
     ) -> SnapshotEnvelope:
+        # Freeze the cold snapshot boundary before hashing/writing; caller
+        # mutations cannot later change the returned envelope either.
+        state = json.loads(canonical_json(state))
+        watermarks = json.loads(canonical_json(watermarks or {}))
         payload = {
             "schema_version": 2,
             "snapshot_seq": int(snapshot_seq),

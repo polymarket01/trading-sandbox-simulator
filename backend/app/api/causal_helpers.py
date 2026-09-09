@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -70,12 +71,12 @@ async def begin_causal_command(
     priority_class: str = "NORMAL",
 ) -> tuple[CommandEnvelope, CommandReceipt, bool]:
     runtime = getattr(getattr(request.app, "state", None), "runtime", None)
+    engine_gate = getattr(runtime, "engine", None)
+    matching_halted = engine_gate is not None and engine_gate.fault.halted
     service = getattr(runtime, "causal_command_service", None)
     writer = getattr(runtime, "persistence_writer", None)
-    if writer is not None and writer.critical_sink_status().get("status") == "HALTED":
-        # Reject before journaling: retries against a halted matcher must not
-        # append full quote ladders to an ever-growing UNKNOWN command log.
-        raise HTTPException(status_code=503, detail={"code": "CRITICAL_SINK_HALTED"})
+    writer_halted = writer is not None and writer.critical_sink_status().get("status") == "HALTED"
+    blocked = matching_halted or writer_halted
     body = _payload_dict(payload)
     command_id = command_id_for(request, payload)
     if hasattr(payload, "command_id"):
@@ -92,7 +93,7 @@ async def begin_causal_command(
         # itself.  The durable row still records the command sequence/time at
         # journal commit; clients that need a logical timestamp may send one.
         logical_timestamp = 0
-    sequence = await service.allocate_command_sequence() if service is not None else 0
+    sequence = await service.allocate_command_sequence() if service is not None and not blocked else 0
     envelope = CommandEnvelope.create(
         command_id=command_id,
         command_type=command_type,
@@ -114,6 +115,19 @@ async def begin_causal_command(
         client_order_id=(client_order_id or body.get("client_order_id")) if service is not None else None,
         payload=body if service is not None else {},
     )
+    if blocked:
+        # A committed/unknown retry is a read, even while new writes are fenced.
+        # Only this cold rejection path performs the extra lookup.
+        existing = await service.get_for_account(command_id, int(user.id)) if service is not None else None
+        if existing is not None:
+            if existing.request_fingerprint != envelope.request_fingerprint:
+                existing = replace(existing, status="IDEMPOTENCY_CONFLICT", ack_stage="IDEMPOTENCY_CONFLICT")
+            return envelope, existing, False
+        raise HTTPException(status_code=503, detail={
+            "code": "MATCHING_HALTED" if matching_halted else "CRITICAL_SINK_HALTED",
+            "status": "NOT_EXECUTED", "scope": "instance",
+            "reason": engine_gate.fault.reason if matching_halted else "critical sink halted",
+        })
     if service is None:
         return (
             envelope,
@@ -182,6 +196,18 @@ async def complete_causal_command(
         published = getattr(runtime, "published_orderbooks", {}).get(str(envelope.symbol).upper())
         if published is not None:
             effective_book_sequence = int(getattr(published, "seq", 0) or 0)
+    execution_status = str(public_result.get("status") or "")
+    if execution_status in {"UNKNOWN", "UNKNOWN_TIMEOUT", "UNKNOWN_AFTER_RESTART"}:
+        receipt = await service.mark_unknown(envelope.command_id, status="UNKNOWN_TIMEOUT" if execution_status == "UNKNOWN" else execution_status,
+                                             reason=str(public_result.get("first_error") or execution_status))
+        output = dict(response if response is not None else public_result)
+        if receipt is not None:
+            output["causal"] = receipt.as_dict()
+        return output
+    if execution_status in {"NOT_EXECUTED", "REJECTED"}:
+        receipt = await service.reject(envelope, code=execution_status, stage="MATCHING_ADMISSION",
+                                       reason=str(public_result.get("first_error") or execution_status), response=public_result)
+        return {**public_result, "causal": receipt.as_dict()}
     receipt = await service.complete(
         envelope,
         public_result,
@@ -239,3 +265,11 @@ async def reject_causal_command(
         reason=reason,
         response={"error": reason},
     )
+
+
+def matching_ack_response(result: dict):
+    """Older bot clients use HTTP failure as their execution fence."""
+    if str(result.get("status") or "") in {"UNKNOWN", "UNKNOWN_TIMEOUT", "UNKNOWN_AFTER_RESTART", "NOT_EXECUTED"}:
+        from fastapi.responses import ORJSONResponse
+        return ORJSONResponse(status_code=503, content=result)
+    return result

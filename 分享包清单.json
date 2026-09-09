@@ -15,13 +15,13 @@
     },
     {
       "path": "README.md",
-      "size": 1428,
-      "sha256": "8b0205e4c57c33ad2e543968582cb765243997d03a8a079a18952bad54eb44a2"
+      "size": 7452,
+      "sha256": "5e6c70d372b3c4e6cd1370eb72da774bbb813edb438f1ff35a5ac209058aba3f"
     },
     {
       "path": "backend/alembic/env.py",
-      "size": 1532,
-      "sha256": "b8e113e52d91d0e55d8038f469d14be4f50e11e511fa6a63c86389ea788b8799"
+      "size": 1742,
+      "sha256": "6e27e7cc26b8a5a4b5a73282c93eb5a9dc043a5180f6172e6484ae1cf6db424b"
     },
     {
       "path": "backend/alembic/versions/20260317_0001_init.py",
@@ -215,8 +215,8 @@
     },
     {
       "path": "backend/alembic/versions/20260317_0039_causal_chain.py",
-      "size": 8118,
-      "sha256": "5b6b15aa51dbea5e878bab6a3167dd2954e8e2b31fc911bfe8b6b0a195fe74fb"
+      "size": 8002,
+      "sha256": "5a6aef18b05cb9b647d5f39ac1660168930489246fef88f86eb7b94ed8c192ae"
     },
     {
       "path": "backend/alembic/versions/20260317_0039_paper_exchange.py",
@@ -227,6 +227,11 @@
       "path": "backend/alembic/versions/20260317_0040_market_visibility.py",
       "size": 844,
       "sha256": "4de64e8b4cf80ae82be00ab1535b6772cee3f832470802baf6c55b1be6fdad5b"
+    },
+    {
+      "path": "backend/alembic/versions/20260909_0042_contract_order_reserve.py",
+      "size": 401,
+      "sha256": "59c30eb22c89c82c193cfc38e622158373bcf889f018dde9b919715e32ab5a45"
     },
     {
       "path": "backend/alembic.ini",
@@ -250,8 +255,8 @@
     },
     {
       "path": "backend/app/api/auth.py",
-      "size": 4634,
-      "sha256": "f62efcd3b1324981c2f43dbef592b64c7b3360b71917ef522d770d2b73eb2369"
+      "size": 5548,
+      "sha256": "62235b64cb606b8112252dad2b5ef78c6adb53e0127bd4c769bd86e8fc94b636"
     },
     {
       "path": "backend/app/api/causal.py",
@@ -260,8 +265,8 @@
     },
     {
       "path": "backend/app/api/causal_helpers.py",
-      "size": 8967,
-      "sha256": "cd010b2fbf167bab95d78cfb57f870f786e972400c482d6c4a8ac8bb26ad5706"
+      "size": 11095,
+      "sha256": "7e30c72d0d30bee5f21e54e219f1d59c01ee22d15aeda298428bcc4301d277ba"
     },
     {
       "path": "backend/app/api/contract_ladder.py",
@@ -270,13 +275,13 @@
     },
     {
       "path": "backend/app/api/contracts.py",
-      "size": 63594,
-      "sha256": "244f03a16c34e26d2b97f0a6f99f12ba9e9cf59d617c5a13de670df8b36b296a"
+      "size": 67228,
+      "sha256": "503845954c2afe2d0a7244701fd0e82c4b7c5a4d1616276a3221822ff12052eb"
     },
     {
       "path": "backend/app/api/deps.py",
-      "size": 1826,
-      "sha256": "0cc3d034fec16243ea9dfbd530b81e7d0210ee9be3c288f5c1041717de1fa438"
+      "size": 2529,
+      "sha256": "80d9c3614853c8faf48a56923f6e971133334c7063d7253e6446383319f3af7e"
     },
     {
       "path": "backend/app/api/durable_helpers.py",
@@ -285,18 +290,23 @@
     },
     {
       "path": "backend/app/api/liquidity_control.py",
-      "size": 27431,
-      "sha256": "1a0fb31b0592dec2fddf8e96b48491c015ed9bf98b29ee2e450fdb7232517e73"
+      "size": 30137,
+      "sha256": "4412b6e12cbebee5122e97f0f3aa35cba4e071ba4e21edcefdb940104dbfb856"
+    },
+    {
+      "path": "backend/app/api/market_data.py",
+      "size": 6767,
+      "sha256": "a9c245d901137c79790c58d236465e5538560d32138c653dc55afabacca8e20a"
     },
     {
       "path": "backend/app/api/paper.py",
-      "size": 67204,
-      "sha256": "61ab53c1f083da1345c63cb8535e770123e0039ff9fe8fc127ca2b3652d2210a"
+      "size": 67288,
+      "sha256": "afb63bf5baf09bd768e2c2949a9e0e7e3c117920033389c6eac9d5f8e0b4a97f"
     },
     {
       "path": "backend/app/api/private.py",
-      "size": 37383,
-      "sha256": "1aefa306936bec8e5e57eddc4b2bb3dde80accdad8ec7baa4eeaf172f5f4b0e9"
+      "size": 41577,
+      "sha256": "8b1e766c33500b834ef67d53bf28bc31de050c849561b752b42841928cff3ae0"
     },
     {
       "path": "backend/app/api/public.py",
@@ -305,8 +315,8 @@
     },
     {
       "path": "backend/app/core/config.py",
-      "size": 11386,
-      "sha256": "b8b1b47b57e2a983d7a8a91d73c74d987749cfb5ebbbaf02abfefaad5370ecca"
+      "size": 11524,
+      "sha256": "1e1ef9dc9c27a2ec499bb3f986ed5a8c6051f5dc1b20374fe2a8c4178a308fb2"
     },
     {
       "path": "backend/app/core/constants.py",
@@ -335,13 +345,18 @@
     },
     {
       "path": "backend/app/db/session.py",
-      "size": 3187,
-      "sha256": "11d930e2c2c31c913aee051babe3a4590dc80ac7435d584db7e45d7d31ccfd49"
+      "size": 5062,
+      "sha256": "f30c2a31df2e1987305887ec2212019f021f9c415fd5eddce59f89e0803e6ae9"
     },
     {
       "path": "backend/app/db/sqlite_observability.py",
-      "size": 520,
-      "sha256": "f07fe385f7fa3e1ecd17198e9ed1cb5f2887ee8aa90fc8dc1a73683aad6c167c"
+      "size": 2130,
+      "sha256": "af1b818d38e42486713c0b00116104a6d2374c8645c752f7654465e0c1658da3"
+    },
+    {
+      "path": "backend/app/db/sqlite_startup.py",
+      "size": 3561,
+      "sha256": "e3c181d83cf8fa50f96fe96960b4e203c4889394884313ef1a77369f19426e66"
     },
     {
       "path": "backend/app/liquidity_map/__init__.py",
@@ -390,8 +405,8 @@
     },
     {
       "path": "backend/app/main.py",
-      "size": 73773,
-      "sha256": "b6233b059459bab71a5524e5c2c37301bf9a3b54c8042d4cda00196ba4dac62e"
+      "size": 75619,
+      "sha256": "882732dfd542b0539f17ccf78c4de5ace2d3c94d7d3b468288f4f43f652340b5"
     },
     {
       "path": "backend/app/maker_strategies/__init__.py",
@@ -405,8 +420,8 @@
     },
     {
       "path": "backend/app/maker_strategies/simple_bbo/algorithm.py",
-      "size": 14525,
-      "sha256": "83a1447cbe266eb8c05d7dc19eabdbfb31c3febd2b35750ac7966ed9c9714fa5"
+      "size": 14859,
+      "sha256": "4875471050640acbfdc780f5fe239a4cb36df2295cfcb3e2b9b36b088452b365"
     },
     {
       "path": "backend/app/maker_strategies/simple_bbo/config_schema.json",
@@ -530,8 +545,8 @@
     },
     {
       "path": "backend/app/models/display_kline.py",
-      "size": 1831,
-      "sha256": "1de7021cda3bd5d0f13c26f178f56e2d3fb27b00b61eb823bd3b9cc33fa1fbfa"
+      "size": 1835,
+      "sha256": "f712922add35d63cbf1b839fb417b48e3ef4c8574fce92727a9ea5095351dcb1"
     },
     {
       "path": "backend/app/models/domain_event_log.py",
@@ -585,8 +600,8 @@
     },
     {
       "path": "backend/app/models/order.py",
-      "size": 3243,
-      "sha256": "4784bc95c11d1d102b36912fb2c22e06d5c4e61e080ca7687df117687602b051"
+      "size": 3320,
+      "sha256": "aa7593a4d607c01bc465b759414f8930bf15b67664e60cd743c8f17d15dbd566"
     },
     {
       "path": "backend/app/models/paper_exchange.py",
@@ -635,8 +650,8 @@
     },
     {
       "path": "backend/app/multiprocess/engine_worker.py",
-      "size": 35433,
-      "sha256": "5209fe388549d4aa7337f2d10a874d49a2ddfeb973bbeb9619e1dff3947bf3cf"
+      "size": 36503,
+      "sha256": "7d6d599cc12167530eb799355ba6e4bf728bb2fa9d1f59000a34c624d2fcec7b"
     },
     {
       "path": "backend/app/multiprocess/feed.py",
@@ -645,8 +660,8 @@
     },
     {
       "path": "backend/app/multiprocess/gateway.py",
-      "size": 55616,
-      "sha256": "e94040cbd1be9e25ada9ac5858ab629c93b989b1e66dcd14ab61b2275b37cd06"
+      "size": 56429,
+      "sha256": "6a50a0d8ea7b4be9b11f41ceb4c294bbc5bcc773a77531815aea73eaf099a635"
     },
     {
       "path": "backend/app/multiprocess/metrics.py",
@@ -670,8 +685,8 @@
     },
     {
       "path": "backend/app/schemas/api.py",
-      "size": 25604,
-      "sha256": "84e5b241531aa1ece4625584ae890a01ddfbc634c644df1755531e50b80d88a8"
+      "size": 25676,
+      "sha256": "601c6ce395ae41d93e59acbad8518435d2bd09a29076ecf177440a9c16b47d8e"
     },
     {
       "path": "backend/app/schemas/quote_set.py",
@@ -680,8 +695,8 @@
     },
     {
       "path": "backend/app/seed/bootstrap.py",
-      "size": 65681,
-      "sha256": "f8c813e60c2a1fa8dbd8ba4242259421df0d9667de686fb9d76c93313e14294e"
+      "size": 65871,
+      "sha256": "102d47f3f94b09b3ba11ea9281fb050a85998716d24cb2b07511ce62fe3134b5"
     },
     {
       "path": "backend/app/services/account_service.py",
@@ -725,8 +740,8 @@
     },
     {
       "path": "backend/app/services/causal_command_service.py",
-      "size": 18656,
-      "sha256": "eab5363fcfa92de269a026f3f80d3e450c916e14d4e3c8a54f2fdc09811cf552"
+      "size": 18898,
+      "sha256": "093dd712b9ed76cc31cac44893af8e85d6e1def93017edd6115c4e23b8d8e4e6"
     },
     {
       "path": "backend/app/services/causal_contracts.py",
@@ -755,13 +770,13 @@
     },
     {
       "path": "backend/app/services/contract_ladder_adapter.py",
-      "size": 20427,
-      "sha256": "749ebc9c466352901a19486b2dc52d8d5fd2bdce1ae0854c796f78fc27396ea9"
+      "size": 28465,
+      "sha256": "052195b69487cc307ff02d81f1871044160400353152131f209cd75c3c57324c"
     },
     {
       "path": "backend/app/services/contract_ladder_feed.py",
-      "size": 11703,
-      "sha256": "5f252247591ab1b33350313e5e52c20b5edf17cbd63e64cc916f3da0ed167f60"
+      "size": 12506,
+      "sha256": "f1bac2dd633114f41b854fcb7d0413468216675b14e18177c25248e44d5ce300"
     },
     {
       "path": "backend/app/services/contract_ladder_index.py",
@@ -790,23 +805,28 @@
     },
     {
       "path": "backend/app/services/contract_maintenance_service.py",
-      "size": 33408,
-      "sha256": "d6f8a295de360e5705fcbf5ab96852b002c1d55ef3cad747891ea8e73c7fc7c1"
+      "size": 45613,
+      "sha256": "b2668c4bbe03501811c74563573d4554fead01b04bbea57bd3ca34b44e1e0d1f"
+    },
+    {
+      "path": "backend/app/services/contract_netting.py",
+      "size": 2765,
+      "sha256": "ad32b9ff742a82d503299755d788eda207fb155505994689dcbf8501ea0ed88b"
     },
     {
       "path": "backend/app/services/contract_price_service.py",
-      "size": 24103,
-      "sha256": "ba923f2557682f57c95014d7cd99fd542b77b12cc1165426e26f6f5fc8efbc02"
+      "size": 26841,
+      "sha256": "fbee2eb04da182b199f411020045a032ae3d2c1df73d92a61984aa348a803238"
     },
     {
       "path": "backend/app/services/contract_service.py",
-      "size": 231789,
-      "sha256": "445b842a991e6b68a5f5d00b8b346b1a9e8091c077843a6fd32866ce075699fb"
+      "size": 262581,
+      "sha256": "95779a3f554436f3893f7d83b23fb53a8739723828a1b6b992a36dd1111326be"
     },
     {
       "path": "backend/app/services/exchange_core.py",
-      "size": 53323,
-      "sha256": "fef8e15b57aeafea6647f2a3fda14f590022fa39816c0b10869b150a3a8b4d90"
+      "size": 59499,
+      "sha256": "076f25e86fcd47930b785358af2cc597810cc5add52e004f6cd64dd3e73daaff"
     },
     {
       "path": "backend/app/services/execution_events.py",
@@ -840,8 +860,13 @@
     },
     {
       "path": "backend/app/services/independent_flow_service.py",
-      "size": 18900,
-      "sha256": "92ab88df71dc58a49332eea9b4fb6349602ce2f70a24dae1693c5293bde7ed41"
+      "size": 19056,
+      "sha256": "26071b45c6c23ee61f7aea8abd0a3a2382ca2bf225add579aa416d78b7d81556"
+    },
+    {
+      "path": "backend/app/services/instance_profile.py",
+      "size": 6291,
+      "sha256": "a9b7b4ceadfdbc4b9dfc08e8ad9c91cd8b2196d44b42176053da9c5318083f4a"
     },
     {
       "path": "backend/app/services/latest_wins_scheduler.py",
@@ -855,8 +880,8 @@
     },
     {
       "path": "backend/app/services/maker_execution.py",
-      "size": 9968,
-      "sha256": "e5a25c0352f8b8c4859d0e1d3107fb30b80649a12bfc381140ae5c82b46566fc"
+      "size": 10436,
+      "sha256": "8f3b97319b9bf44f6ac98e580a76d82728de6532ca13a7c27684db4e9af9878b"
     },
     {
       "path": "backend/app/services/maker_initialization.py",
@@ -880,18 +905,23 @@
     },
     {
       "path": "backend/app/services/market_data_service.py",
-      "size": 40881,
-      "sha256": "04ec6e89bb18477467cd20e65709f4807ebf780e96bc1e73887a77261befedb5"
+      "size": 48709,
+      "sha256": "b0bdea38a5e17049f207d562ca95ea4ce17d3c69d853220697e17e8839eb0dc7"
     },
     {
       "path": "backend/app/services/matching_engine.py",
-      "size": 37779,
-      "sha256": "53d50702d5167aa8788b1432aea8cdefe6c7ac3d1d00b9e2d1935c074af9b615"
+      "size": 45753,
+      "sha256": "58f90269b3393a589c35238d7a033791b06328c519ebea11085e55f2006f8227"
+    },
+    {
+      "path": "backend/app/services/matching_faults.py",
+      "size": 1434,
+      "sha256": "25a729cccdaa8c3d7bcafdfc389ea3de95cac1c673ed4e496a1e0f4f926f3591"
     },
     {
       "path": "backend/app/services/order_service.py",
-      "size": 211998,
-      "sha256": "ed163393c343970a3feb34cf34fc22c7705811ae33a19e2c0cdc96550f87196c"
+      "size": 214231,
+      "sha256": "80b134456cb4610f7f14a83037fb4475629dd11b9dda810165733230d021044d"
     },
     {
       "path": "backend/app/services/paper_account_service.py",
@@ -905,8 +935,8 @@
     },
     {
       "path": "backend/app/services/persistence_writer.py",
-      "size": 77156,
-      "sha256": "88fc366f89ade6d8a9005e8a71454bccad6cb271c57c2728846ba6006173fc8a"
+      "size": 82691,
+      "sha256": "65fc85c09ffe711b24ab217d3a3f3e73176601becdfd1abdc65bf71c7e87ea98"
     },
     {
       "path": "backend/app/services/process_status.py",
@@ -914,9 +944,14 @@
       "sha256": "8b66247d3433ec727fe7c9e8b7c7871cece78bc20f35288951cd217ac87880f3"
     },
     {
+      "path": "backend/app/services/public_trade_tape.py",
+      "size": 3948,
+      "sha256": "39a41fe802c2cb688314bab6c4f028874658c1cde85f94656e054575a5ad566c"
+    },
+    {
       "path": "backend/app/services/quote_set_service.py",
-      "size": 41845,
-      "sha256": "d01087f088107ca53bc825c0eb5ccd689aba21b47683810b6f777285340c363c"
+      "size": 41969,
+      "sha256": "62f0f8a3736718221dc4a6cc0d963ee27a848d7b3e5b78d76f467c6a09fed3f0"
     },
     {
       "path": "backend/app/services/rate_limiter.py",
@@ -940,8 +975,8 @@
     },
     {
       "path": "backend/app/services/runtime.py",
-      "size": 34473,
-      "sha256": "ff2884110414423a155e6e368cb45ead2a9dbbf93d48a1fde2d17094358357a7"
+      "size": 37489,
+      "sha256": "2c4bd61ccd58394cb29b3c7d94a444e38b59a967898f6e4202278b9a2b22d150"
     },
     {
       "path": "backend/app/services/sandbox_db_guard.py",
@@ -955,8 +990,8 @@
     },
     {
       "path": "backend/app/services/sequencer.py",
-      "size": 19019,
-      "sha256": "53bbe1af71babd5559ec84f2ce2bf317d5fd0977f832dc26267fbc92395e81f5"
+      "size": 20638,
+      "sha256": "73cfd75b6b21aa097c6efeefc5bbd4984f7692fcaff9eedfd49b8369502aae4c"
     },
     {
       "path": "backend/app/services/shadow_differential.py",
@@ -970,8 +1005,8 @@
     },
     {
       "path": "backend/app/services/spot_bbo_adapter.py",
-      "size": 5554,
-      "sha256": "3f1a5122944a01978d74fe331f59f66b36d31a6e851ecb04b9ca21544db7bd83"
+      "size": 5735,
+      "sha256": "4ce8d3ccf70938a852fce7a1b4266bc2ddd78b9f10b889405e5a1f8298ac84e8"
     },
     {
       "path": "backend/app/services/sqlite_worker_guard.py",
@@ -979,9 +1014,14 @@
       "sha256": "5ec977723c91aebb441a6953ea6efbe8b0a5997d6b14e574f36d67f5b1e84d5a"
     },
     {
+      "path": "backend/app/services/sqlite_write_admission.py",
+      "size": 4638,
+      "sha256": "19266731b12a77d85f633f8593727b091f23d2e91610268b0d362d8339588cf0"
+    },
+    {
       "path": "backend/app/services/state_snapshot.py",
-      "size": 7953,
-      "sha256": "c52da45bea8b3de60e32ac3aae32645e9cbd9addcb7226da2f1d96e476b34d83"
+      "size": 8214,
+      "sha256": "ff955d017979d156e066ce3117f678130172f899fccc930657b6131fe16003ff"
     },
     {
       "path": "backend/app/services/strategy_accounts.py",
@@ -990,8 +1030,8 @@
     },
     {
       "path": "backend/app/services/strategy_config_service.py",
-      "size": 10096,
-      "sha256": "8a8ca00c20516d50a119a8e70f7f8ab92b08ca3668225ac0b31a5afa3073d9eb"
+      "size": 10373,
+      "sha256": "32c35704ea08d7ebadd0a53d1d809d7931c9055daa527a51a360810cb7f082b1"
     },
     {
       "path": "backend/app/services/synthetic_flow_service.py",
@@ -1080,8 +1120,8 @@
     },
     {
       "path": "frontend/src/components/AppShell.tsx",
-      "size": 10916,
-      "sha256": "a8713fde4a1a26c59714ec640c406c27aa85ef5b3ea5a9158d2e6f1c9ba3ddff"
+      "size": 11101,
+      "sha256": "9b078f3b3e0a61c476a9719caeeb39cbbaf302c6e6b93b9960e8c50cbd278645"
     },
     {
       "path": "frontend/src/components/ConnectionBadge.tsx",
@@ -1095,8 +1135,8 @@
     },
     {
       "path": "frontend/src/components/ContractOrderForm.tsx",
-      "size": 12350,
-      "sha256": "527bd923f31268ec71f737d3c86275da67c614bee488127c1fdcc2253d346ea2"
+      "size": 12712,
+      "sha256": "5721339b582cd20ecd463f470e74f48d9719f6b96789aa10c8ed7be214b135fe"
     },
     {
       "path": "frontend/src/components/InstalledMakerSelect.tsx",
@@ -1140,8 +1180,8 @@
     },
     {
       "path": "frontend/src/components/RecordsTabs.tsx",
-      "size": 11067,
-      "sha256": "578137e3c7362740915461c73ba62b19a1898ebf93bad28fd0e482a4ebd5da04"
+      "size": 11146,
+      "sha256": "9441e28137c2ace3afe238af7ccd7bed3a5c270e299375b44e81053beed76ad7"
     },
     {
       "path": "frontend/src/components/ToastViewport.tsx",
@@ -1152,6 +1192,11 @@
       "path": "frontend/src/components/TradesPanel.tsx",
       "size": 2324,
       "sha256": "c843b2c583790f19ceb66a15c22e0480082d05f34b457cf2f750fccb2172276b"
+    },
+    {
+      "path": "frontend/src/components/terminal/BinanceBookReference.tsx",
+      "size": 5573,
+      "sha256": "92b0bf0d4578652b03ecddf2e0f67cfe52a6e701744cf4f3e89b3a9a20e86b14"
     },
     {
       "path": "frontend/src/components/terminal/MarketSidebar.tsx",
@@ -1165,13 +1210,13 @@
     },
     {
       "path": "frontend/src/components/terminal/TerminalOrderBook.tsx",
-      "size": 12536,
-      "sha256": "6669d99e795333533f82bbe26455355b4db42e9adc58e15b026f12251e91e671"
+      "size": 13184,
+      "sha256": "1a930e29879da96b0758bf0766f5e9cb185ae0969ce408ead5d854cd29f6b457"
     },
     {
       "path": "frontend/src/components/terminal/TerminalOrderPanel.tsx",
-      "size": 12399,
-      "sha256": "905b72b9b15cf634b2be09deefdf7a45244bc76081eaf944d1a6806dc5d9121f"
+      "size": 12485,
+      "sha256": "7ed409e7f79f1d7be89807377993d6ad413ba15fb4bef942864456c2551c88bb"
     },
     {
       "path": "frontend/src/components/terminal/TerminalOrdersTabs.tsx",
@@ -1190,8 +1235,8 @@
     },
     {
       "path": "frontend/src/components/terminal/TradeTerminal.tsx",
-      "size": 11659,
-      "sha256": "b08f6a41c0eeaa5b6c56408d9b8f6bf4ef2580b89d0b274e49c9cebbf473d0c6"
+      "size": 11741,
+      "sha256": "eb05e26c75e97372abf27a3c7a48b7ba93693a5a0f03d6e6949026021dabe7dc"
     },
     {
       "path": "frontend/src/components/terminal/types.ts",
@@ -1210,13 +1255,13 @@
     },
     {
       "path": "frontend/src/hooks/useLiveMakerSymbols.ts",
-      "size": 1723,
-      "sha256": "d0d2794bfdd0808ff2160db6ddc134d7d122756b750a17ac4de9f23a60c89380"
+      "size": 916,
+      "sha256": "19fb3ec32f568465e49e7f70c5c32618bab0e787ab3a497bd9397d668cd4d7db"
     },
     {
       "path": "frontend/src/hooks/useMarketStreams.ts",
-      "size": 18504,
-      "sha256": "4f92ec014f5460641e2642cae015887a2d1195e31a89069626c0cfcfb3e7ec9c"
+      "size": 18498,
+      "sha256": "f4095253027dc7fe7a4a33b539d01c662232040e18217112ba064d87095c6f62"
     },
     {
       "path": "frontend/src/hooks/usePaperAccount.ts",
@@ -1230,13 +1275,23 @@
     },
     {
       "path": "frontend/src/index.css",
-      "size": 29468,
-      "sha256": "fe0e1fc1c996f6cd66793f6564c1a5aef139a871727e00da3f40f4d7968648c6"
+      "size": 29533,
+      "sha256": "a769e82ea8c71c590d1a0441b71f39b687c7905b4b17ac6248ae401c2ff7b940"
+    },
+    {
+      "path": "frontend/src/lib/bookReference.ts",
+      "size": 761,
+      "sha256": "fd27079440430f2229dd5780056ef481a26d686661dd04ed12816e868f895f22"
+    },
+    {
+      "path": "frontend/src/lib/close-position.ts",
+      "size": 2078,
+      "sha256": "da908633418a622165c5b6dc87c877234e6a6f4496217f5fbccf3ad66178c189"
     },
     {
       "path": "frontend/src/lib/config.ts",
-      "size": 1403,
-      "sha256": "e4d87d28b132aed038216cdd57fc3632368250860e7b099083b942a2c9fc947a"
+      "size": 1527,
+      "sha256": "4e9761678ccfee66954b84a3300c3901ff377c628d944b1d6ea9bc6dc5c3115f"
     },
     {
       "path": "frontend/src/lib/crypto.ts",
@@ -1280,18 +1335,18 @@
     },
     {
       "path": "frontend/src/main.tsx",
-      "size": 433,
-      "sha256": "ac2136ae1d84cbcbe38e0127efd06b1f16c5492797762f2702da5913fa9ab7d2"
+      "size": 507,
+      "sha256": "326d44f4addaca93a8b4eadd7548174ff15e564ceefb15e962458e439ab6a453"
     },
     {
       "path": "frontend/src/pages/AdminPage.tsx",
-      "size": 1078744,
-      "sha256": "c38d7c530a442315ea3bcead5cec1bf5ab0db10bfa6fb97becc4f92221d12957"
+      "size": 1079368,
+      "sha256": "fda54fc03965cb36ffd5f7b6a22d8864077a68b27202fcf7ec205c41bcb988b6"
     },
     {
       "path": "frontend/src/pages/ContractFastTradePage.tsx",
-      "size": 25206,
-      "sha256": "3b18ccb23d9f2538bc587f40e8c2998144ff132a86793d12a352ba7f8772d5d3"
+      "size": 25215,
+      "sha256": "b08b4b48741e98a0166790ab4a7765f04567ff29df5def3877c3caabe5654e5e"
     },
     {
       "path": "frontend/src/pages/ContractLadderPage.tsx",
@@ -1310,13 +1365,13 @@
     },
     {
       "path": "frontend/src/pages/LiquidityControlPage.tsx",
-      "size": 22126,
-      "sha256": "048daaebd69510cc49cfc3db9367c4719587f6116fcceeb762de255c3b79df2a"
+      "size": 22604,
+      "sha256": "29bf87b6f44c8485c20fe6922e4395c664344d2b48d59a8b37591a54bb93a07e"
     },
     {
       "path": "frontend/src/pages/LiquidityMapPage.tsx",
-      "size": 940,
-      "sha256": "085e61fd8f0fab159f0ec4de0ff87826967d16a8519080b6f151d67c570ea8f0"
+      "size": 967,
+      "sha256": "949994f3f3869fa9cdb798a3259cd36a5d5708e2a14736d9fcd8728014eb7b5c"
     },
     {
       "path": "frontend/src/pages/LoginPage.tsx",
@@ -1330,13 +1385,13 @@
     },
     {
       "path": "frontend/src/pages/OrderbookMonitorPage.tsx",
-      "size": 34004,
-      "sha256": "3d4bf67da62c44cc744814ef491477423701e9f2ea672528a140fc76b03611a6"
+      "size": 33993,
+      "sha256": "04c42696ffa2b6e9965b647b4214f671021a923e7567d714ada02390ec5fc1c7"
     },
     {
       "path": "frontend/src/pages/PaperAccountPage.tsx",
-      "size": 13608,
-      "sha256": "dfddb94e28e75e9a3ad19f886d261353a8541159df7502fb0cf54098ba1e23cd"
+      "size": 15074,
+      "sha256": "41a169846c0c7f7c5b79503d6664b5c0e9b60ea2053b4c303c83865f434aecfc"
     },
     {
       "path": "frontend/src/pages/PaperAdminPage.tsx",
@@ -1350,13 +1405,13 @@
     },
     {
       "path": "frontend/src/pages/PaperAuthPage.tsx",
-      "size": 7287,
-      "sha256": "3c80e2656a67534d79b86e80a13dc2df513d298be4be7455f6fd2f6059d80872"
+      "size": 7450,
+      "sha256": "a6d3348ed397ae30b2bc623eaa254f78e1e91dae17c87152fcd3858c5199b6d0"
     },
     {
       "path": "frontend/src/pages/PaperOrdersPage.tsx",
-      "size": 26656,
-      "sha256": "ae0e4f6d9b379c4733ccdb010577fee4087b6db89237e9154b58a52fb21be9bb"
+      "size": 26744,
+      "sha256": "671ccdfd7d23a61aea6b421a0280c7ed1e53df9ccdb5b01775bbea17d09203d1"
     },
     {
       "path": "frontend/src/pages/PluginParameters.tsx",
@@ -1380,8 +1435,8 @@
     },
     {
       "path": "frontend/src/pages/TradePage.tsx",
-      "size": 23099,
-      "sha256": "db2b9d5ea1ba2c8e7658b21fbb2793fca8d99a6e80922230e3398b7add8ee4bb"
+      "size": 24469,
+      "sha256": "6e5913d279ffc7290cfa7fef8547f2364c9266b17544ca5e92637edd4cb153b8"
     },
     {
       "path": "frontend/src/store/useAppStore.ts",
@@ -1430,8 +1485,8 @@
     },
     {
       "path": "沙盒交易所_分享说明.md",
-      "size": 4104,
-      "sha256": "3320240c4723b57f39bfd1d31fedbca91a506b28a9a935ebb1af003b51851633"
+      "size": 4936,
+      "sha256": "344dd69ee698c996c77ec0ef02e7a7547b1d667bd4d75dfed996663d0fc77375"
     }
   ]
 }

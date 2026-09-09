@@ -1173,3 +1173,5 @@ button:disabled { cursor: not-allowed; }
   .hl-terminal .hl-workspace { grid-template-columns: minmax(260px, 1fr) minmax(440px, 1.4fr) 320px; }
   .hl-terminal .hl-book-column { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 142px; }
 }
+
+.app-shell-inner.app-shell-wide { max-width: none !important; }

@@ -1,4 +1,5 @@
 import { isActiveContractPosition } from "../lib/paper";
+import { preparePositionClose } from "../lib/close-position";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { api } from "../api/client";
@@ -179,7 +180,10 @@ export function TradePage() {
         api.get<{ items: TradeItem[] }>(`/markets/${currentSymbol}/trades?limit=100`),
         api.get<KlineResponse>(`/markets/${currentSymbol}/klines?interval=${encodeURIComponent(selectedInterval)}&limit=300`),
         nextIsContract ? api.get<ContractAccount>("/contracts/account", accountApiKey) : api.get<{ items: BalanceItem[] }>("/account/balances", accountApiKey),
-        nextIsContract ? api.get<{ items: ContractPosition[] }>(`/contracts/positions?symbol=${currentSymbol}`, accountApiKey) : Promise.resolve({ items: [] as ContractPosition[] }),
+        nextIsContract ? api.get<{ items: ContractPosition[] }>(`/contracts/positions?symbol=${currentSymbol}`, accountApiKey).then((response) => {
+          if (requestId === refreshSeqRef.current) setContractPositions(response.items);
+          return response;
+        }) : Promise.resolve({ items: [] as ContractPosition[] }),
         nextIsContract ? api.get<{ setting: { leverage: string } }>(`/contracts/settings/${currentSymbol}`, accountApiKey).catch(() => undefined) : Promise.resolve(undefined),
         nextIsContract ? api.get<ContractPriceState>(`/contracts/prices/${currentSymbol}?refresh_external=true`).catch(() => undefined) : Promise.resolve(undefined),
         nextIsContract ? api.get<{ items: OrderItem[] }>(`/contracts/orders/open?symbol=${currentSymbol}`, accountApiKey) : api.get<{ items: OrderItem[] }>(`/account/orders/open?symbol=${currentSymbol}`, accountApiKey),
@@ -351,34 +355,51 @@ export function TradePage() {
     }
   };
 
+  const closeBusyRef = useRef(false);
   const closePosition = async (position: TerminalPosition) => {
-    if (!loggedIn) return;
+    if (!loggedIn || closeBusyRef.current) return;
+    closeBusyRef.current = true;
+    ++refreshSeqRef.current; // Retire refreshes that captured the old position.
     setSubmitting(true);
     setSubmitError("");
+    let closeResponseReceived = false;
     try {
+      const fresh = await preparePositionClose(api, accountApiKey, position.symbol, position.side);
+      setContractPositions(fresh.items);
+      const current = fresh.items.find((item) => item.symbol === position.symbol && item.side === position.side && Number(item.quantity) > 0);
+      if (!current) {
+        pushToast("info", "该方向已无可平持仓");
+        return;
+      }
       const payload: Record<string, unknown> = {
         symbol: position.symbol,
         side: position.side === "long" ? "sell" : "buy",
         type: "market",
         tif: "ioc",
-        quantity: position.quantity,
+        quantity: current.quantity,
         position_action: "close",
         reduce_only: true,
-        leverage: position.leverage,
+        leverage: current.leverage,
         client_order_id: `perp-close-${Date.now()}`,
       };
       const response = await api.post<{ order: OrderItem }>("/contracts/orders", payload, accountApiKey);
+      closeResponseReceived = true;
       if (response.order.status === "filled") {
         pushToast("success", `${position.symbol} 仓位已市价平仓`);
       } else if (response.order.status === "rejected") {
         pushToast("error", `平仓被拒绝：${response.order.reject_reason ?? "未知原因"}`);
       } else {
-        pushToast("success", `${position.symbol} 平仓订单已提交`);
+        pushToast("info", `已成交 ${response.order.filled_quantity}，本单剩余 ${response.order.remaining_quantity} 未成交并已撤销；不会自动追单`);
       }
-      await refreshAll();
+      // Position freshness must not wait on chart, history, or external price requests.
+      const after = await api.get<{ items: ContractPosition[] }>(`/contracts/positions?symbol=${position.symbol}`, accountApiKey);
+      ++refreshSeqRef.current;
+      setContractPositions(after.items);
+      void refreshAll();
     } catch (reason) {
-      pushToast("error", reason instanceof Error ? reason.message : "平仓失败");
+      pushToast("error", closeResponseReceived ? "订单结果已返回，但仓位刷新失败，请刷新持仓后查看" : reason instanceof Error ? reason.message : "平仓失败");
     } finally {
+      closeBusyRef.current = false;
       setSubmitting(false);
     }
   };
